@@ -33,3 +33,9 @@ src-tauri/gen
 .env
 .env.*
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+
