@@ -123,6 +123,32 @@ def convert(raw: dict, page_sizes: list[tuple[float, float]]) -> dict:
     return result
 
 
+import io
+
+
+class _NullStdout:
+    """用于包装 sys.stdout，安全丢弃 OpenDataLoader 的 JAR 实时日志输出。
+
+    OpenDataLoader 的 runner.py 会调用 sys.stdout.buffer.write/flush() 把 Java 日志
+    实时写回 stdout。当 Python 被 Tauri 以管道方式启动时，Windows 下对 pipe 的
+    raw buffer 调用 flush() 会抛出 OSError: [Errno 22] Invalid argument。
+    这里把 buffer 替换为 BytesIO，让 flush 不报错，同时丢弃不需要的 JAR 日志
+    （解析结果已经写到 output_dir 的 JSON 文件中）。
+    """
+
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+
+    def write(self, s: str) -> int:
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
 def run_opendataloader(pdf_path: str, work_dir: str, force_ocr: bool = False) -> None:
     """调用 OpenDataLoader 解析；force_ocr 用于扫描版 fallback。"""
     kwargs = {
@@ -133,7 +159,15 @@ def run_opendataloader(pdf_path: str, work_dir: str, force_ocr: bool = False) ->
     if force_ocr:
         kwargs["force_ocr"] = True
         kwargs["ocr_engine"] = "tesseract"
-    opendataloader_pdf.convert(**kwargs)
+
+    # Windows pipe 环境下，OpenDataLoader 直接 flush sys.stdout.buffer 会失败。
+    # 临时替换 stdout 为安全对象，convert 结束后再恢复，避免影响后续 progress()。
+    old_stdout = sys.stdout
+    sys.stdout = _NullStdout()
+    try:
+        opendataloader_pdf.convert(**kwargs)
+    finally:
+        sys.stdout = old_stdout
 
 
 def main() -> int:
