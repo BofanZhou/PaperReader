@@ -97,6 +97,11 @@ function PageSlot({
       style={{ width: pageW, marginBottom: PAGE_GAP }}
       data-page={page.pageNumber}
     >
+      {/* 调试信息 overlay */}
+      <div className="pointer-events-none absolute left-0 top-0 z-10 px-1 py-0.5 text-[10px] text-red-600/80 bg-yellow-100/80 rounded">
+        P{page.pageNumber} {pageW.toFixed(0)}×{pageH.toFixed(0)} rot={viewport?.rotation ?? 0}
+      </div>
+
       {/* 页面占位 sentinel（虚拟滚动观察点） */}
       <div
         ref={(el) => registerSentinel(el, page.pageNumber)}
@@ -150,6 +155,9 @@ function PageSlot({
                     wordBreak: "break-word",
                     background: hl ? `${hl}55` : undefined,
                     boxShadow: hl ? `inset 0 0 0 1.5px ${hl}` : undefined,
+                    // 调试：显示 TextLayer 边框与半透明文字，便于排查错位问题
+                    border: "1px solid rgba(255,0,0,0.4)",
+                    color: "rgba(255,0,0,0.6)",
                   }}
                 >
                   <span className="whitespace-pre-wrap">{textContent(el)}</span>
