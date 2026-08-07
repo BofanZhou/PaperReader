@@ -145,8 +145,12 @@ def main() -> int:
     output_dir = sys.argv[2]
     work_dir = sys.argv[3]
 
+    # 诊断信息：帮助排查 Tauri 与命令行行为差异
+    progress("starting", 1, f"Python: {sys.executable} ({sys.version.split()[0]})")
+    progress("starting", 2, f"opendataloader_pdf: {opendataloader_pdf.__file__}")
+
     try:
-        progress("starting", 2, "启动解析引擎")
+        progress("starting", 3, "启动解析引擎")
         os.makedirs(work_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
 
@@ -194,9 +198,14 @@ def main() -> int:
         progress("done", 100, f"解析完成，共 {len(page_sizes)} 页")
         print(f"OUTPUT {out_path}", flush=True)
         return 0
-    except Exception as e:  # noqa: BLE001
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else -1
+        error_out(f"OpenDataLoader 调用导致 Python 进程退出 (exit code={code})")
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    except BaseException as e:  # noqa: BLE001
         tb = traceback.format_exc()
-        error_out(f"{e}\n{tb}")
+        error_out(f"{type(e).__name__}: {e}\n{tb}")
         # 同时把 traceback 写到 stderr，便于本地调试
         traceback.print_exc(file=sys.stderr)
         return 1

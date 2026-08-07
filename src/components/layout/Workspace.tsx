@@ -160,14 +160,22 @@ function ParsingView({ fileName, progress }: { fileName: string; progress: { per
 /** 解析错误 + 引导 */
 function ErrorView({ fileName, error, onRetry, onOpenFile }: { fileName: string; error: string | null; onRetry: () => void; onOpenFile: () => void }) {
   const info = friendlyParseError(error ?? "");
+  const lines = info.desc.split("\n");
+  const headline = lines[0] ?? "";
+  const rest = lines.slice(1).join("\n");
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-8">
       <AlertTriangle className="size-12 text-error" aria-hidden />
       <div className="text-center">
         <p className="text-sm font-medium">{fileName}</p>
         <p className="mt-2 text-base font-medium">{info.title}</p>
-        <p className="mt-1 max-w-2xl whitespace-pre-wrap text-left text-sm text-fg-secondary">{info.desc}</p>
+        <p className="mt-1 max-w-2xl text-left text-sm font-medium text-fg">{headline}</p>
       </div>
+      {rest && (
+        <div className="max-h-[40vh] w-full max-w-2xl overflow-auto rounded-lg border border-border bg-bg-secondary p-3">
+          <pre className="whitespace-pre-wrap text-left text-xs text-fg-secondary">{rest}</pre>
+        </div>
+      )}
       <div className="flex gap-2">
         <Button variant="outline" size="sm" onClick={onRetry}>
           <RefreshCw aria-hidden /> 重试

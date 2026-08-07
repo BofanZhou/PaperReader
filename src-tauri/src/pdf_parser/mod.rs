@@ -225,8 +225,8 @@ fn spawn_stderr_collector(stderr: std::process::ChildStderr) -> std::sync::Arc<s
     buf
 }
 
-/// 将解析失败的完整错误写入日志，便于排查
-fn log_parse_error(app: &AppHandle, pdf_path: &str, message: &str) -> Result<(), String> {
+/// 将解析失败的完整错误写入日志，便于排查；返回日志文件路径
+fn log_parse_error(app: &AppHandle, pdf_path: &str, message: &str) -> Result<PathBuf, String> {
     let logs_dir = app_data_dir(app)?.join("logs");
     fs::create_dir_all(&logs_dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
     let path = logs_dir.join(format!(
@@ -236,7 +236,7 @@ fn log_parse_error(app: &AppHandle, pdf_path: &str, message: &str) -> Result<(),
     let mut f = fs::File::create(&path).map_err(|e| format!("创建日志文件失败: {}", e))?;
     writeln!(f, "PDF: {}", pdf_path).map_err(|e| e.to_string())?;
     writeln!(f, "{}", message).map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(path)
 }
 
 // ========== 对外命令 ==========
@@ -313,11 +313,15 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
             detail = format!("退出码 {}", status.code().unwrap_or(-1));
         }
 
-        let _ = log_parse_error(&app, &pdf_path, &detail);
+        let log_path = log_parse_error(&app, &pdf_path, &detail)
+            .unwrap_or_else(|e| PathBuf::from(format!("<无法写入日志: {}>", e)));
 
         // 简化前端显示：只取第一行作为标题，完整信息仍保留
         let headline = detail.lines().next().unwrap_or("解析失败").to_string();
-        return Err(format!("ERR:PARSE_FAILED:{headline}\n\n{detail}"));
+        return Err(format!(
+            "ERR:PARSE_FAILED:{headline}\n\n{detail}\n\n日志: {}",
+            log_path.display()
+        ));
     }
 
     // 7. 读取结果
