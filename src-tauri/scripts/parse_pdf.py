@@ -30,6 +30,15 @@ import traceback
 import opendataloader_pdf
 from pypdf import PdfReader
 
+# 强制 stdout/stderr 使用 UTF-8 —— Rust 端 BufReader::lines() 按 UTF-8 解析；
+# Windows 上 Python 默认 cp936，含中文消息时会导致 Rust 端读流中断。
+# reconfigure 是 no-op 若 stdout 已被替换（如 _NullStdout）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # OpenDataLoader 元素类型 → PaperReader 元素类型
 TYPE_MAP = {
     "paragraph": "paragraph",
@@ -43,15 +52,64 @@ TYPE_MAP = {
 
 PROGRESS = "PROGRESS"
 
+# 用 ContextVar 让 main() 把 output_dir 传给 error_out()，避免函数签名被层层穿透。
+# 即便 output_dir 还没设置（main() 早期），error_out 也能优雅退化只写 stdout。
+from contextvars import ContextVar  # noqa: E402
+_ERROR_LOG_DIR: ContextVar = ContextVar("error_log_dir", default=None)
+
+
+def safe_print(*args, **kwargs) -> bool:
+    """print 包装：捕获 Tauri 子进程上下文下的 pipe 问题。
+
+    Windows 上 Tauri 用 Stdio::piped() 创建 4KB buffer 的 pipe，父进程读不及
+    或 pipe 异常关闭时，Python print 会抛 BrokenPipeError 或 OSError [Errno 22]
+    Invalid argument。这种情况下继续解析才是用户想要的（结果写到 output_dir
+    文件），不应让 pipe 异常杀掉 Python 进程。
+
+    返回 True 表示写出去了；False 表示 pipe 不可写。
+    """
+    try:
+        print(*args, **kwargs)
+        return True
+    except (BrokenPipeError, ValueError, OSError):
+        return False
+
 
 def progress(stage: str, percent: int, message: str) -> None:
-    print(f"{PROGRESS} {stage} {percent} {message}", flush=True)
+    safe_print(f"{PROGRESS} {stage} {percent} {message}", flush=True)
 
 
 def error_out(message: str) -> None:
-    """输出 ERROR 行；多行信息替换为字面 \n，避免破坏行协议。"""
+    """输出 ERROR 行；多行信息替换为字面 \\n，避免破坏行协议。
+
+    三重兜底：
+    1. 按协议写 stdout（Rust 端按行解析）
+    2. stdout / 后续 stderr 也 broken 时，写到 output_dir/ERROR_{ts}.log
+       （彻底绕开 pipe，错误详情不会丢失）
+    """
     safe = message.replace("\r", "").replace("\n", "\\n")
-    print(f"ERROR {safe}", flush=True)
+    line = f"ERROR {safe}"
+    safe_print(line, flush=True)  # 主通道：stdout（失败也无所谓）
+    # 备用通道：stderr（多行原貌，供 Rust 端 stderr collector 兜底）
+    try:
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+    except (BrokenPipeError, ValueError, OSError):
+        pass
+
+    # 终极兜底：output_dir/ERROR_{ts}.log —— 完全不依赖 pipe
+    fallback_dir = _ERROR_LOG_DIR.get(None)
+    if fallback_dir:
+        try:
+            # 加微秒避免同秒多次失败互相覆盖
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            with open(
+                os.path.join(fallback_dir, f"ERROR_{ts}.log"), "w", encoding="utf-8"
+            ) as f:
+                f.write(message + "\n")
+        except OSError:
+            pass
 
 
 def table_to_text(el: dict) -> str:
@@ -69,12 +127,23 @@ def table_to_text(el: dict) -> str:
     return "\n".join(lines)
 
 
+def _safe_int(value, default=None):
+    """OpenDataLoader 的 heading level / page number 等字段类型不稳定（可能是
+    int / float / str / None），统一转 int，失败时返回 default。"""
+    if value is None:
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def convert(raw: dict, page_sizes: list[tuple[float, float]]) -> dict:
     """OpenDataLoader 原始 JSON → PaperReader 内部格式"""
     pages: dict[int, list[dict]] = {}
     reading_order = 0
     for el in raw.get("kids", []):
-        page_num = int(el.get("page number", 1))
+        page_num = _safe_int(el.get("page number"), default=1) or 1
         if page_num < 1:
             continue
         bbox = el.get("bounding box") or [0.0, 0.0, 0.0, 0.0]
@@ -98,10 +167,13 @@ def convert(raw: dict, page_sizes: list[tuple[float, float]]) -> dict:
                 },
                 "text": text,
                 "font": el.get("font"),
-                "font_size": el.get("font size"),
-                "heading_level": el.get("heading level"),
-                "reading_order": reading_order,
-                "image_src": img_src,
+                # Rust 端 ParsedElement 用 #[serde(rename_all = "camelCase")]，
+                # 前端 ParsedElement 类型也是 camelCase。Python 写出 parsed.json
+                # 时必须用 camelCase，否则缓存反序列化时 missing field。
+                "fontSize": el.get("font size"),
+                "headingLevel": _safe_int(el.get("heading level")),
+                "readingOrder": reading_order,
+                "imageSrc": img_src,
             }
         )
         reading_order += 1
@@ -150,18 +222,26 @@ class _NullStdout:
 
 
 def run_opendataloader(pdf_path: str, work_dir: str, force_ocr: bool = False) -> None:
-    """调用 OpenDataLoader 解析；force_ocr 用于扫描版 fallback。"""
+    """调用 OpenDataLoader 解析；force_ocr 用于扫描版 fallback。
+
+    quiet=True 是关键：让 OpenDataLoader 走 subprocess.run 模式（runner.py:37-54）
+    而非 streaming Popen（runner.py:57-81）。后者会在 JAR 逐行输出时调用
+    sys.stdout.buffer.flush()，在 Windows + Tauri 子进程管道下会抛
+    OSError: [Errno 22] Invalid argument —— 这是当前解析失败的根因。
+    quiet 模式下 JAR 输出在内部被读取并丢弃，生成结果仍写到 output_dir 文件。
+    """
     kwargs = {
         "input_path": [pdf_path],
         "output_dir": work_dir,
         "format": "json",
+        "quiet": True,
     }
     if force_ocr:
         kwargs["force_ocr"] = True
         kwargs["ocr_engine"] = "tesseract"
 
-    # Windows pipe 环境下，OpenDataLoader 直接 flush sys.stdout.buffer 会失败。
-    # 临时替换 stdout 为安全对象，convert 结束后再恢复，避免影响后续 progress()。
+    # 兜底：替换 sys.stdout 为安全对象，避免即便 quiet=True 时仍有边缘场景
+    # 触发对 sys.stdout.buffer 的 raw 操作。
     old_stdout = sys.stdout
     sys.stdout = _NullStdout()
     try:
@@ -178,6 +258,10 @@ def main() -> int:
     pdf_path = sys.argv[1]
     output_dir = sys.argv[2]
     work_dir = sys.argv[3]
+
+    # 让 error_out() 知道兜底日志写哪里；这里设上兜底，覆盖 OpenDataLoader
+    # 后续任意时刻抛错（包括 pipe broken）都能落盘。
+    _ERROR_LOG_DIR.set(output_dir)
 
     # 诊断信息：帮助排查 Tauri 与命令行行为差异
     progress("starting", 1, f"Python: {sys.executable} ({sys.version.split()[0]})")
@@ -230,18 +314,24 @@ def main() -> int:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=1)
         progress("done", 100, f"解析完成，共 {len(page_sizes)} 页")
-        print(f"OUTPUT {out_path}", flush=True)
+        safe_print(f"OUTPUT {out_path}", flush=True)
         return 0
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else -1
         error_out(f"OpenDataLoader 调用导致 Python 进程退出 (exit code={code})")
-        traceback.print_exc(file=sys.stderr)
+        try:
+            traceback.print_exc(file=sys.stderr)
+        except (BrokenPipeError, ValueError, OSError):
+            pass
         return 1
     except BaseException as e:  # noqa: BLE001
         tb = traceback.format_exc()
         error_out(f"{type(e).__name__}: {e}\n{tb}")
-        # 同时把 traceback 写到 stderr，便于本地调试
-        traceback.print_exc(file=sys.stderr)
+        # 同时把 traceback 写到 stderr，便于本地调试（pipe 坏了就算了）
+        try:
+            traceback.print_exc(file=sys.stderr)
+        except (BrokenPipeError, ValueError, OSError):
+            pass
         return 1
 
 

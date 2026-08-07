@@ -207,7 +207,11 @@ fn spawn_stdout_reader(
     (error_buf, rx)
 }
 
-/// 读取子进程 stderr（后台线程收集，避免阻塞）
+/// 读取子进程 stderr（后台线程收集，避免阻塞）。
+///
+/// stderr 默认上限 64KB：足够完整保留一个 Python traceback（约 2-4KB），
+/// 同时避免超长 JAR 异常输出撑爆内存。Rust 端拼接错误详情时优先使用
+/// stdout 中的 ERROR 行（包含完整 traceback），stderr 仅作补充兜底。
 fn spawn_stderr_collector(stderr: std::process::ChildStderr) -> std::sync::Arc<std::sync::Mutex<String>> {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let buf2 = buf.clone();
@@ -216,7 +220,7 @@ fn spawn_stderr_collector(stderr: std::process::ChildStderr) -> std::sync::Arc<s
         for line in reader.lines() {
             let Ok(line) = line else { break };
             let mut b = buf2.lock().unwrap();
-            if b.len() < 4096 {
+            if b.len() < 65536 {
                 b.push_str(&line);
                 b.push('\n');
             }
@@ -241,6 +245,25 @@ fn log_parse_error(app: &AppHandle, pdf_path: &str, message: &str) -> Result<Pat
 
 // ========== 对外命令 ==========
 
+/// 同一 PDF 的并发解析互斥锁。
+///
+/// 当用户连续点击「重试」或切换文件再切回同一 PDF 时，避免两个 Python
+/// 进程同时写 `papers/{uuid}/parsed.json` 导致 race condition。
+/// 用 `tokio::sync::Mutex`（异步友好）按 uuid 分桶；用 std::sync::OnceLock 做
+/// 全局静态初始化（Rust 1.70+ 内置，无需 once_cell 依赖）。
+static PARSE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn lock_for(uuid: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let map = PARSE_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map.lock().unwrap();
+    map.entry(uuid.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// 解析 PDF：输入路径，输出 ParsedResult（含缓存与进度事件）
 #[tauri::command]
 pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult, String> {
@@ -253,15 +276,38 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
         return Err("ENV:OPENDATALOADER_NOT_READY".into());
     }
 
+    // 0.5 同 PDF 并发互斥：第二个调用方会等待第一个完成（解析结果会被缓存，
+    // 等第一个完成时第二个能直接命中缓存，几乎无感）。
+    let uuid = pdf_uuid(&pdf_path);
+    let lock = lock_for(&uuid);
+    let _guard = lock.lock().await;
+
     // 1. 缓存：papers/{uuid}/parsed.json
-    let paper_dir = papers_dir(&app)?.join(pdf_uuid(&pdf_path));
+    let paper_dir = papers_dir(&app)?.join(&uuid);
     fs::create_dir_all(&paper_dir).map_err(|e| e.to_string())?;
     let out_json = paper_dir.join("parsed.json");
     if out_json.exists() {
-        let raw = fs::read_to_string(&out_json).map_err(|e| format!("读取缓存失败: {}", e))?;
-        let result: ParsedResult =
-            serde_json::from_str(&raw).map_err(|e| format!("缓存解析失败: {}", e))?;
-        return Ok(result);
+        // 缓存反序列化失败时降级重新解析（Python/Rust 字段命名变化时会触发）。
+        // 只有序列化成功才直接返回，避免被旧缓存卡住。
+        if let Ok(raw) = fs::read_to_string(&out_json) {
+            if let Ok(result) = serde_json::from_str::<ParsedResult>(&raw) {
+                return Ok(result);
+            }
+            // 旧缓存格式不匹配，丢弃并重新解析
+            let _ = fs::remove_file(&out_json);
+        }
+    }
+
+    // 1.5 清理上次失败遗留的 ERROR_*.log，避免本次解析失败时误读旧内容。
+    // ERROR_*.log 由 Python 端在 except 兜底写入；本次解析前清掉，保证只反映本次错误。
+    if let Ok(entries) = fs::read_dir(&paper_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("ERROR_") && name.ends_with(".log") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 
     // 2. Python
@@ -303,11 +349,32 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
         }
     };
 
-    // 6. 失败处理：优先使用 stdout ERROR 行的完整 traceback，stderr 作补充
+    // 6. 失败处理：优先使用 stdout ERROR 行的完整 traceback，stderr / ERROR.log 作补充
     if !status.success() {
         let mut detail = stdout_error.lock().unwrap().take().unwrap_or_default();
         if detail.is_empty() {
             detail = stderr_buf.lock().unwrap().trim().to_string();
+        }
+        // 终极兜底：Python 写到 paper_dir/ERROR_*.log（绕开 pipe）。当上述 stdout / stderr
+        // 都因 Tauri pipe broken 而丢失时，这个文件包含完整错误详情。Python 端用时间戳
+        // 命名避免同秒覆盖；这里取最新一个。
+        if detail.is_empty() {
+            if let Ok(entries) = fs::read_dir(&paper_dir) {
+                let mut err_logs: Vec<_> = entries
+                    .flatten()
+                    .filter(|e| {
+                        let n = e.file_name();
+                        let n = n.to_string_lossy();
+                        n.starts_with("ERROR_") && n.ends_with(".log")
+                    })
+                    .collect();
+                err_logs.sort_by_key(|e| e.file_name());
+                if let Some(latest) = err_logs.last() {
+                    if let Ok(content) = fs::read_to_string(latest.path()) {
+                        detail = content.trim().to_string();
+                    }
+                }
+            }
         }
         if detail.is_empty() {
             detail = format!("退出码 {}", status.code().unwrap_or(-1));

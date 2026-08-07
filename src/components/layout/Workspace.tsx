@@ -3,7 +3,6 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
   BookOpen,
-  CheckCircle2,
   FileText,
   FolderOpen,
   Loader2,
@@ -14,6 +13,15 @@ import { Progress } from "../ui/progress";
 import { Sidebar } from "./Sidebar";
 import { useAppStore } from "../../store/appStore";
 import { getLastParseLog } from "../../lib/env";
+import { PDFViewer } from "../pdf/PDFViewer";
+import { SelectionPopup } from "../pdf/SelectionPopup";
+import type {
+  ContextMenuAction,
+  Highlight,
+  HighlightColorId,
+  SelectionState,
+  TargetLang,
+} from "../../types/pdf";
 
 const SIDEBAR_MIN = 280;
 const SIDEBAR_MAX = 480;
@@ -40,7 +48,7 @@ function friendlyParseError(err: string): { title: string; desc: string } {
 
 /** 主体工作区：左侧 PDF 阅读区 + 右侧可拖拽侧边栏 */
 export function Workspace({ onOpenFile }: Props) {
-  const { currentFile, parseState, parseProgress, parsedResult, parseError, runParse } =
+  const { currentFile, parseState, parseProgress, parsedResult, parseError, runParse, viewMode } =
     useAppStore();
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT);
   const dragging = useRef(false);
@@ -89,8 +97,8 @@ export function Workspace({ onOpenFile }: Props) {
           <ParsingView fileName={fileName(currentFile)} progress={parseProgress} />
         ) : parseState === "error" ? (
           <ErrorView fileName={fileName(currentFile)} error={parseError} onRetry={() => runParse().catch(() => {})} onOpenFile={onOpenFile} />
-        ) : parsedResult ? (
-          <ResultView result={parsedResult} onOpenFile={onOpenFile} />
+        ) : parsedResult && currentFile ? (
+          <ReaderView result={parsedResult} pdfPath={currentFile} viewMode={viewMode} />
         ) : (
           <EmptyHome onOpenFile={onOpenFile} />
         )}
@@ -207,45 +215,146 @@ function ErrorView({ fileName, error, onRetry, onOpenFile }: { fileName: string;
   );
 }
 
-/** 解析完成：结果摘要（完整渲染在 Prompt 3 接入） */
-function ResultView({ result, onOpenFile }: { result: import("../../lib/env").ParsedResult; onOpenFile: () => void }) {
-  const totalElements = result.pages.reduce((acc, p) => acc + p.elements.length, 0);
-  const typeCount = result.pages.reduce<Record<string, number>>((acc, p) => {
-    for (const el of p.elements) acc[el.type] = (acc[el.type] ?? 0) + 1;
-    return acc;
-  }, {});
-  const typeLabels: Record<string, string> = {
-    paragraph: "段落",
-    heading: "标题",
-    caption: "图注",
-    table: "表格",
-    figure: "图片",
-    formula: "公式",
-  };
+/** 阅读视图（Prompt 3）：PDF.js 渲染 + 选中即翻译浮动弹窗 */
+function ReaderView({
+  result,
+  pdfPath,
+  viewMode,
+}: {
+  result: import("../../lib/env").ParsedResult;
+  pdfPath: string;
+  viewMode: "original" | "translated" | "bilingual";
+}) {
+  const areaRef = useRef<HTMLDivElement | null>(null);
+  const [containerRect, setContainerRect] = useState<DOMRect | null>(null);
+  const [selection, setSelection] = useState<SelectionState | null>(null);
+  const [activeColor, setActiveColor] = useState<HighlightColorId>("yellow");
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
+  const [translation, setTranslation] = useState<{ target: TargetLang; text: string } | null>(null);
+  const [translating, setTranslating] = useState(false);
+
+  // 阅读区边界（弹窗不覆盖侧边栏）
+  useEffect(() => {
+    const el = areaRef.current;
+    if (!el) return;
+    const update = () => setContainerRect(el.getBoundingClientRect());
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const handleSelectText = useCallback((sel: SelectionState) => {
+    setSelection(sel);
+    setTranslation(null);
+  }, []);
+
+  // 翻译 stub：Prompt 4 接入真实翻译引擎前，先返回占位（保留完整交互链路）
+  const handleTranslate = useCallback(async (text: string, lang: TargetLang) => {
+    setTranslating(true);
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+      setTranslation({
+        target: lang,
+        text: `【译文待接入 · Prompt 4 翻译引擎】\n${text}`,
+      });
+    } finally {
+      setTranslating(false);
+    }
+  }, []);
+
+  const handleHighlight = useCallback(
+    (colorId: HighlightColorId) => {
+      if (!selection?.elementId) return;
+      const h: Highlight = {
+        id: typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `hl-${Date.now()}`,
+        elementId: selection.elementId,
+        colorId,
+        range: selection.range ?? undefined,
+        createdAt: Date.now(),
+      };
+      setHighlights((prev) => [...prev, h]);
+      setSelection(null);
+    },
+    [selection],
+  );
+
+  const handleNote = useCallback((text: string) => {
+    // Prompt 6 接入完整笔记系统；当前先保留选中态
+    console.info("[note] 选中文本已保留，笔记系统将在 Prompt 6 接入:", text.slice(0, 50));
+  }, []);
+
+  const handleAiDiscuss = useCallback((text: string) => {
+    // Prompt 4 接入聊天侧边栏
+    console.info("[ai-discuss] 将选中文本注入聊天（Prompt 4）:", text.slice(0, 50));
+  }, []);
+
+  const handleExplainFormula = useCallback((text: string) => {
+    console.info("[formula] 公式解释（Prompt 4）:", text.slice(0, 50));
+  }, []);
+
+  const handleContextMenuAction = useCallback(
+    (action: ContextMenuAction) => {
+      switch (action.kind) {
+        case "highlight":
+          setHighlights((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID?.() ?? `hl-${Date.now()}`,
+              elementId: action.elementId,
+              colorId: activeColor,
+              createdAt: Date.now(),
+            },
+          ]);
+          break;
+        case "copy-original":
+          navigator.clipboard.writeText(action.text).catch(() => {});
+          break;
+        case "copy-translated":
+          navigator.clipboard.writeText(action.text).catch(() => {});
+          break;
+        case "note":
+          handleNote(action.text);
+          break;
+        case "ai-discuss":
+          handleAiDiscuss(action.text);
+          break;
+      }
+    },
+    [activeColor, handleNote, handleAiDiscuss],
+  );
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 p-8">
-      <div className="flex size-14 items-center justify-center rounded-2xl bg-success/10">
-        <CheckCircle2 className="size-7 text-success" aria-hidden />
-      </div>
-      <div className="text-center">
-        <p className="text-base font-medium">{result.title ?? fileName(result.pdfPath)}</p>
-        {result.author && <p className="mt-1 text-xs text-fg-tertiary">{result.author}</p>}
-      </div>
-      <div className="flex gap-3 text-xs text-fg-secondary">
-        <span>{result.pages.length} 页</span>
-        <span>·</span>
-        <span>{totalElements} 个元素</span>
-        {Object.entries(typeCount).map(([t, n]) => (
-          <span key={t}>
-            · {typeLabels[t] ?? t} {n}
-          </span>
-        ))}
-      </div>
-      <p className="text-xs text-fg-tertiary">版面渲染（原文/译文/对照）将在下一步接入</p>
-      <Button variant="outline" size="sm" onClick={onOpenFile}>
-        <FolderOpen aria-hidden /> 更换文件
-      </Button>
+    <div ref={areaRef} className="relative h-full overflow-hidden">
+      <PDFViewer
+        pdfUrl={pdfPath}
+        result={result}
+        mode={viewMode}
+        highlights={highlights}
+        onSelectText={handleSelectText}
+        onContextMenuAction={handleContextMenuAction}
+      />
+
+      {selection && (
+        <SelectionPopup
+          selection={selection}
+          containerRect={containerRect}
+          activeColor={activeColor}
+          translation={translation}
+          translating={translating}
+          onTranslate={handleTranslate}
+          onHighlight={(c) => {
+            setActiveColor(c);
+            handleHighlight(c);
+          }}
+          onNote={handleNote}
+          onAiDiscuss={handleAiDiscuss}
+          onExplainFormula={handleExplainFormula}
+          onClose={() => setSelection(null)}
+        />
+      )}
     </div>
   );
 }

@@ -16,7 +16,10 @@ fn main() {
             let src = std::path::Path::new(&manifest_dir).join(&script_src);
             let dst_dir = std::path::Path::new(&target_dir).join("debug").join("scripts");
             let dst = dst_dir.join("parse_pdf.py");
-            if let Err(e) = copy_if_newer(&src, &dst) {
+            // 直接强制拷贝，不做 mtime 比较 —— NTFS 上偶尔出现 dst ≥ src 的
+            // 误判，导致 src 改动后 target 仍是旧版本（已踩过两次坑）。
+            // 文件只有几 KB，开销可忽略。
+            if let Err(e) = force_copy(&src, &dst) {
                 eprintln!("build.rs: 复制脚本到 target/debug 失败: {}", e);
             } else {
                 println!("cargo:rerun-if-changed={}", src.display());
@@ -25,16 +28,7 @@ fn main() {
     }
 }
 
-fn copy_if_newer(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    if let Ok(dst_meta) = std::fs::metadata(dst) {
-        if let Ok(src_meta) = std::fs::metadata(src) {
-            if dst_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                >= src_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            {
-                return Ok(()); // 已存在且不更旧
-            }
-        }
-    }
+fn force_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
