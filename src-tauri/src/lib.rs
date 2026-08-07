@@ -16,6 +16,7 @@ pub fn run() {
             env_manager::check_environment,
             env_manager::install_component,
             pdf_parser::parse_pdf,
+            pdf_parser::get_last_parse_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

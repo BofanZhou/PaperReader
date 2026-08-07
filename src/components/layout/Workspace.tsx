@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { openPath } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
   BookOpen,
   CheckCircle2,
+  FileText,
   FolderOpen,
   Loader2,
   RefreshCw,
@@ -11,6 +13,7 @@ import { Button } from "../ui/button";
 import { Progress } from "../ui/progress";
 import { Sidebar } from "./Sidebar";
 import { useAppStore } from "../../store/appStore";
+import { getLastParseLog } from "../../lib/env";
 
 const SIDEBAR_MIN = 280;
 const SIDEBAR_MAX = 480;
@@ -163,6 +166,19 @@ function ErrorView({ fileName, error, onRetry, onOpenFile }: { fileName: string;
   const lines = info.desc.split("\n");
   const headline = lines[0] ?? "";
   const rest = lines.slice(1).join("\n");
+
+  const handleOpenLog = async () => {
+    try {
+      const path = await getLastParseLog();
+      await openPath(path);
+    } catch (e) {
+      // 如果获取/打开失败，降级打开日志目录
+      const { appDataDir } = await import("@tauri-apps/api/path");
+      const dir = await appDataDir();
+      await openPath(`${dir}/logs`).catch(() => {});
+    }
+  };
+
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-8">
       <AlertTriangle className="size-12 text-error" aria-hidden />
@@ -179,6 +195,9 @@ function ErrorView({ fileName, error, onRetry, onOpenFile }: { fileName: string;
       <div className="flex gap-2">
         <Button variant="outline" size="sm" onClick={onRetry}>
           <RefreshCw aria-hidden /> 重试
+        </Button>
+        <Button variant="outline" size="sm" onClick={handleOpenLog}>
+          <FileText aria-hidden /> 查看详细日志
         </Button>
         <Button size="sm" onClick={onOpenFile}>
           <FolderOpen aria-hidden /> 更换文件

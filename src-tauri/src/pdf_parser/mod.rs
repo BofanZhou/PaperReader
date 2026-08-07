@@ -343,3 +343,34 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
 
     Ok(result)
 }
+
+/// 获取最新的解析错误日志文件路径（供前端“查看详细日志”按钮使用）
+#[tauri::command]
+pub fn get_last_parse_log(app: AppHandle) -> Result<String, String> {
+    let logs_dir = app_data_dir(&app)?.join("logs");
+    if !logs_dir.exists() {
+        return Err("日志目录不存在".into());
+    }
+
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&logs_dir)
+        .map_err(|e| format!("读取日志目录失败: {}", e))?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("parse_error_") && n.ends_with(".log"))
+                .unwrap_or(false)
+        })
+        .filter_map(|e| {
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path()))
+        })
+        .collect();
+
+    entries.sort_by(|a, b| b.0.cmp(&a.0)); // 最新的在前
+
+    entries
+        .first()
+        .map(|(_, p)| p.to_string_lossy().to_string())
+        .ok_or_else(|| "未找到解析错误日志".into())
+}

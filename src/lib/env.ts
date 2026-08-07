@@ -92,3 +92,6 @@ export const parsePdf = (pdfPath: string): Promise<ParsedResult> =>
 /** 订阅解析进度事件 */
 export const onPdfProgress = (cb: (p: ParseProgress) => void): Promise<UnlistenFn> =>
   listen<ParseProgress>("pdf-parse-progress", (event) => cb(event.payload));
+
+/** 获取最新的解析错误日志文件路径 */
+export const getLastParseLog = (): Promise<string> => invoke<string>("get_last_parse_log");
