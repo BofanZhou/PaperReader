@@ -1,6 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 mod env_manager;
+mod pdf_parser;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -14,6 +15,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             env_manager::check_environment,
             env_manager::install_component,
+            pdf_parser::parse_pdf,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

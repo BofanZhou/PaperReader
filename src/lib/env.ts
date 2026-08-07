@@ -35,3 +35,60 @@ export const installComponent = (component: EnvComponent | "all"): Promise<Envir
 /** 订阅安装进度事件 */
 export const onEnvProgress = (cb: (p: InstallProgress) => void): Promise<UnlistenFn> =>
   listen<InstallProgress>("env-install-progress", (event) => cb(event.payload));
+
+// ========== PDF 解析（Prompt 2） ==========
+
+export interface Bbox {
+  left: number;
+  bottom: number;
+  right: number;
+  top: number;
+}
+
+export type ElementType =
+  | "paragraph"
+  | "heading"
+  | "caption"
+  | "table"
+  | "figure"
+  | "formula";
+
+export interface ParsedElement {
+  id: string;
+  type: ElementType;
+  bbox: Bbox;
+  text: string;
+  font: string | null;
+  fontSize: number | null;
+  headingLevel: number | null;
+  readingOrder: number;
+  imageSrc: string | null;
+}
+
+export interface ParsedPage {
+  pageNumber: number;
+  width: number;
+  height: number;
+  elements: ParsedElement[];
+}
+
+export interface ParsedResult {
+  pdfPath: string;
+  title: string | null;
+  author: string | null;
+  pages: ParsedPage[];
+}
+
+export interface ParseProgress {
+  stage: "starting" | "parsing" | "converting" | "done";
+  percent: number;
+  message: string;
+}
+
+/** 解析 PDF（Rust 端自动缓存，重复解析同一 PDF 直接返回缓存） */
+export const parsePdf = (pdfPath: string): Promise<ParsedResult> =>
+  invoke<ParsedResult>("parse_pdf", { pdfPath });
+
+/** 订阅解析进度事件 */
+export const onPdfProgress = (cb: (p: ParseProgress) => void): Promise<UnlistenFn> =>
+  listen<ParseProgress>("pdf-parse-progress", (event) => cb(event.payload));

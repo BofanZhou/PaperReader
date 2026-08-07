@@ -92,20 +92,20 @@ const PYPI_MIRROR: &str = "https://mirrors.huaweicloud.com/repository/pypi/simpl
 
 /// 表示一个可执行命令（程序 + 前置参数），用于处理 `py -3` 这类带空格的命令。
 #[derive(Debug, Clone)]
-struct CmdLine {
-    program: String,
-    prefix_args: Vec<String>,
+pub(crate) struct CmdLine {
+    pub(crate) program: String,
+    pub(crate) prefix_args: Vec<String>,
 }
 
 impl CmdLine {
-    fn new(program: impl Into<String>, prefix_args: Vec<String>) -> Self {
+    pub(crate) fn new(program: impl Into<String>, prefix_args: Vec<String>) -> Self {
         Self {
             program: program.into(),
             prefix_args,
         }
     }
 
-    fn command(&self) -> Command {
+    pub(crate) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.prefix_args);
         cmd
@@ -145,7 +145,7 @@ impl CmdLine {
 }
 
 /// 获取应用数据目录（%APPDATA%/com.paperreader.app）
-fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|e| format!("无法获取数据目录: {}", e))
@@ -315,8 +315,8 @@ fn detect_python(app: &AppHandle) -> ComponentStatus {
     }
 }
 
-/// 选择用于安装 / 检测的 python：系统优先，其次内置
-fn pick_python(app: &AppHandle) -> Option<CmdLine> {
+/// 选择用于安装 / 检测的 python：系统优先，其次内置（pdf_parser 也复用此逻辑）
+pub(crate) fn pick_python(app: &AppHandle) -> Option<CmdLine> {
     if let Ok(out) = CmdLine::new("python", vec![]).run_capture(&["--version"]) {
         if !parse_python_version(&out).is_empty() {
             return Some(CmdLine::new("python", vec![]));
