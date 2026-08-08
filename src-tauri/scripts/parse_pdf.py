@@ -513,6 +513,126 @@ def _table_has_content(text: str) -> bool:
     return any(c.strip() for c in text.split("|"))
 
 
+# 表格内容行的判定：短（≤180 字符）、不以句末标点结尾（可能以数字/括号结尾）
+_TABLE_ROW_END = ".!?。！？"
+# 排除明显不是表格行的开头：年份起句、图注、编号标题、LaTeX 公式、OCR 数学符号
+_TABLE_ROW_EXCLUDE = re.compile(r"^\s*(\d{4}\s|fig\.?\s*\d|\d+(\.\d+)*\.\s|\$|\\[a-z]+|[ðþ¼√])")
+
+def _is_table_row_candidate(el: dict) -> bool:
+    """疑似表格内容行：短、无句末标点、非标题/图注/公式/刻度。"""
+    if el["type"] != "paragraph":
+        return False
+    t = el["text"].strip()
+    if not t:
+        return False
+    if len(t) > 180:
+        return False
+    if t[-1] in _TABLE_ROW_END:
+        return False
+    if _TABLE_ROW_EXCLUDE.match(t):
+        return False
+    # 行内含 OCR 数学符号（ð þ ¼ √ 等）→ 公式行，非表格
+    if re.search(r"[ðþ¼√∑∫±≈≡]", t):
+        return False
+    # 纯数字/刻度行（"3.5"、"0.80"、"1E-08 1E-07"）→ 图表坐标轴
+    if re.match(r"^[\d\s.+\-Ee%]+$", t):
+        return False
+    # 变量等式/图例（"d/r = 0"、"ha = h - r"、"kl/kaq = 1E-6"）→ 图表图例
+    if re.match(r"^[a-zA-Z0-9/]+\s*=\s*", t):
+        return False
+    # 公式残留小词（"h2"、"where"、"and"、"1 r"、"q r2"）→ 非表格
+    if len(t) <= 8 and t.islower():
+        return False
+    if re.match(r"^\d+\s+[a-z]", t):
+        return False
+    # 含从属连词的长行（the/that/which 等）→ 正文句子（表格行是短语/值，不用连词）
+    if len(t) > 40 and re.search(r"\b(the|that|which|with|their|because|however)\b", t):
+        return False
+    return True
+
+
+def _make_table_from_rows(rows: list[dict], first: dict) -> dict:
+    """把连续表格行合并为一个 table 元素（text 每行一段，| 分列）。"""
+    lines = []
+    for r in rows:
+        t = r["text"].strip()
+        lines.append(t)
+    return {
+        "id": first["id"],
+        "type": "table",
+        "bbox": first["bbox"],
+        "text": "\n".join(lines),
+        "font": first.get("font"),
+        "fontSize": first.get("fontSize"),
+        "headingLevel": 0,
+        "readingOrder": first["readingOrder"],
+        "imageSrc": None,
+    }
+
+
+def _detect_table_runs(elements: list[dict]) -> list[dict]:
+    """检测「表格内容区段」：候选行（短、无句末标点、非公式/标题）按 bbox top
+    聚类成带，带间距紧凑（<60pt）则归同一区段，区段 ≥4 行 → 合并为 table 元素。
+    不依赖 kids 顺序（表格行常散落在正文之间）。"""
+    cands = [el for el in elements if _is_table_row_candidate(el)]
+    if len(cands) < 4:
+        return elements
+    # 排除 figure 内部/紧邻的候选行（图表坐标轴/图例文字不算表格行，bbox 外扩 30pt）
+    fig_boxes = [el["bbox"] for el in elements if el["type"] == "figure"]
+    if fig_boxes:
+        def _inside_figure(c: dict) -> bool:
+            cx = (c["bbox"]["left"] + c["bbox"]["right"]) / 2
+            cy = (c["bbox"]["bottom"] + c["bbox"]["top"]) / 2
+            return any(
+                fb["left"] - 30 <= cx <= fb["right"] + 30
+                and fb["bottom"] - 30 <= cy <= fb["top"] + 30
+                for fb in fig_boxes
+            )
+        cands = [c for c in cands if not _inside_figure(c)]
+    if len(cands) < 4:
+        return elements
+    # 按 top 聚类成带（同带 top 差 < 30pt）
+    cands_sorted = sorted(cands, key=lambda e: e["bbox"]["top"], reverse=True)
+    bands: list[list[dict]] = [[cands_sorted[0]]]
+    for c in cands_sorted[1:]:
+        if abs(bands[-1][-1]["bbox"]["top"] - c["bbox"]["top"]) < 30:
+            bands[-1].append(c)
+        else:
+            bands.append([c])
+    # 带间距紧凑则合并为区段
+    segments: list[list[dict]] = []
+    cur = list(bands[0])
+    for band in bands[1:]:
+        cur_bottom = min(e["bbox"]["top"] for e in cur)
+        band_top = max(e["bbox"]["top"] for e in band)
+        if cur_bottom - band_top < 60:
+            cur.extend(band)
+        else:
+            if len(cur) >= 4:
+                segments.append(cur)
+            cur = list(band)
+    if len(cur) >= 4:
+        segments.append(cur)
+    if not segments:
+        return elements
+
+    used_ids = {e["id"] for seg in segments for e in seg}
+    out: list[dict] = []
+    # 区段按 top 降序（页面从上到下）输出为 table
+    table_els = [
+        _make_table_from_rows(seg, seg[0])
+        for seg in sorted(segments, key=lambda s: max(e["bbox"]["top"] for e in s), reverse=True)
+    ]
+    for el in elements:
+        if el["id"] in used_ids:
+            continue
+        out.append(el)
+    # 把表格插回原位置：按 readingOrder 与剩余元素穿插（简单起见 append 到页尾前按 top 插）
+    # 表格作为块级元素，按 top 排序后 merge
+    merged = sorted(out + table_els, key=lambda e: (e["bbox"]["top"]), reverse=True)
+    return merged
+
+
 def _rebuild_empty_tables(elements: list[dict]) -> list[dict]:
     """修复 OpenDataLoader 表格空壳：
     1. 若能按 bbox 从同页散落段落重组出内容 → 填入表格；
@@ -569,6 +689,7 @@ def _post_process(pages: dict[int, list[dict]], page_sizes: list[tuple[float, fl
         if not els:
             continue
         els = _rebuild_empty_tables(els)
+        els = _detect_table_runs(els)
         if _is_two_column(els, w):
             els = _reorder_two_column(els, w)
         els = _merge_sentence_fragments(els)
