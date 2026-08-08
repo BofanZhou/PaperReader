@@ -298,6 +298,15 @@ def convert(raw: dict, page_sizes: list[tuple[float, float]], work_dir: str) -> 
         )
         reading_order += 1
 
+    # 后处理（可读性优化）：双栏重排 → 断句合并 → 标题识别增强
+    _post_process(pages, page_sizes)
+    # 重排/合并后重新分配全局 readingOrder（页间顺序不变，页内按新顺序）
+    order = 0
+    for p in range(len(page_sizes)):
+        for el in pages.get(p + 1, []):
+            el["readingOrder"] = order
+            order += 1
+
     result = {
         "pdfPath": raw.get("file name", ""),
         "title": (raw.get("title") or "").strip() or None,
@@ -313,6 +322,195 @@ def convert(raw: dict, page_sizes: list[tuple[float, float]], work_dir: str) -> 
         ],
     }
     return result
+
+
+# ========== 可读性后处理（本地启发式，零成本） ==========
+#
+# A-1 双栏重排：学术论文多为双栏，OpenDataLoader 的 kids 顺序对部分版面仍非
+#     人眼阅读序。按 bbox.left 聚成左右两簇（判断足够保守：两簇各 ≥3 元素、
+#     簇中心距 > 35% 页宽），栏内按 top 降序（人眼自上而下），横跨元素
+#     （跨栏标题/图表，宽 ≥ 70% 页宽）按 top 排序置前。
+# A-2 断句合并：相邻 paragraph 前段不以句末标点结尾、后段非大写开头 → 拼接，
+#     修复「集电气、机 / 械、材料和计算机」这类被切碎的句子。
+# A-3/4 标题识别 + 字号聚类：编号标题（1. / 1.2 / 第X章）、全大写短行、
+#     以及字号显著大于正文的短行 → 强制 headingLevel。
+
+_SENT_END = ".!?。！？"
+_CJK_MIN, _CJK_MAX = 0x4E00, 0x9FFF
+_CJK_EXT_MIN, _CJK_EXT_MAX = 0x3400, 0x4DBF
+_NUM_HEADING_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\.?\s+(\S+)")
+_CN_HEADING_RE = re.compile(r"^\s*第[一二三四五六七八九十百千]+[章节篇]")
+_CAPS_HEADING_RE = re.compile(r"^\s*[A-Z][A-Z0-9\s&()\-/:,]{3,80}$")
+
+
+def _is_cjk(ch: str) -> bool:
+    cp = ord(ch)
+    return (_CJK_MIN <= cp <= _CJK_MAX) or (_CJK_EXT_MIN <= cp <= _CJK_EXT_MAX)
+
+
+def _is_two_column(elements: list[dict], page_w: float) -> bool:
+    """保守判断：文本元素 left 中心是否分成左右两簇。"""
+    xs = [
+        (el["bbox"]["left"] + el["bbox"]["right"]) / 2
+        for el in elements
+        if el["bbox"]["right"] - el["bbox"]["left"] < page_w * 0.7
+    ]
+    if len(xs) < 6:
+        return False
+    left = [x for x in xs if x < page_w * 0.5]
+    right = [x for x in xs if x >= page_w * 0.5]
+    if len(left) < 3 or len(right) < 3:
+        return False
+    lc = sum(left) / len(left)
+    rc = sum(right) / len(right)
+    return (rc - lc) > page_w * 0.35
+
+
+def _reorder_two_column(elements: list[dict], page_w: float) -> list[dict]:
+    """双栏重排：横跨元素（宽≥70%页宽，如跨栏标题/表格/图）作为「带」分隔锚点，
+    锚点之间的栏内容按 左栏(top 降序) → 右栏(top 降序) 输出，锚点本身插在
+    对应阅读位置（而不是全部前置）。实现人眼阅读顺序：上到下、每带内左→右。"""
+    full = sorted(
+        (el for el in elements if el["bbox"]["right"] - el["bbox"]["left"] >= page_w * 0.7),
+        key=lambda e: e["bbox"]["top"], reverse=True,
+    )
+    cols = [
+        el for el in elements
+        if el["bbox"]["right"] - el["bbox"]["left"] < page_w * 0.7
+    ]
+    left = sorted(
+        (el for el in cols if el["bbox"]["left"] < page_w * 0.5),
+        key=lambda e: e["bbox"]["top"], reverse=True,
+    )
+    right = sorted(
+        (el for el in cols if el["bbox"]["left"] >= page_w * 0.5),
+        key=lambda e: e["bbox"]["top"], reverse=True,
+    )
+    if not full:
+        return left + right
+
+    result: list[dict] = []
+    prev_top = float("inf")
+    for anchor in full:
+        a_top = anchor["bbox"]["top"]
+        # 当前锚点之上、上一锚点之下的栏内容（left/right 已 top 降序，过滤保持有序）
+        result += [e for e in left if a_top < e["bbox"]["top"] <= prev_top]
+        result += [e for e in right if a_top < e["bbox"]["top"] <= prev_top]
+        result.append(anchor)
+        prev_top = a_top
+    # 最底部锚点之下的剩余内容
+    result += [e for e in left if e["bbox"]["top"] <= prev_top]
+    result += [e for e in right if e["bbox"]["top"] <= prev_top]
+    return result
+
+
+def _try_join(a: dict, b: dict) -> str | None:
+    """若 a、b 是同一句被切开，返回拼接文本；否则 None。"""
+    if a["type"] != "paragraph" or b["type"] != "paragraph":
+        return None
+    ta = a["text"].rstrip()
+    tb = b["text"].lstrip()
+    if not ta or not tb:
+        return None
+    if ta[-1] in _SENT_END:
+        return None  # 前段是完整句
+    # 后段以编号标题开头（"5.1. Influencing..."）→ 是两个标题，不拼
+    if re.match(r"^\s*\d+(\.\d+)*\.?\s+\S", tb):
+        return None
+    # 前段疑似编号标题（"3.3.1 局部抽排烟" 短行无句号）→ 不与其后正文拼接
+    if re.match(r"^\s*\d+(\.\d+)*\.?\s+\S", ta) and "。" not in ta and len(ta) < 40:
+        return None
+    # 英文后段以大写开头 → 疑似新句，保守不拼；中文无大小写
+    if tb[0].isupper():
+        return None
+    # 中中相接不加空格，其余加空格
+    if _is_cjk(ta[-1]) and _is_cjk(tb[0]):
+        return ta + tb
+    return ta + " " + tb
+
+
+def _merge_sentence_fragments(elements: list[dict]) -> list[dict]:
+    """贪心链式合并断句：a+b 成功则替换 a、删 b，继续用合并结果比下一个。"""
+    if len(elements) < 2:
+        return elements
+    out: list[dict] = []
+    i = 0
+    while i < len(elements):
+        cur = elements[i]
+        # 尝试与后续元素链式合并
+        j = i + 1
+        while j < len(elements):
+            merged = _try_join(cur, elements[j])
+            if merged is None:
+                break
+            cur = dict(cur, text=merged)
+            j += 1
+        out.append(cur)
+        i = j
+    return out
+
+
+def _enhance_headings(elements: list[dict]) -> None:
+    """标题识别增强（可读性优化）：
+    - 编号标题（1. / 1.2 / 第X章）、全大写短行 → 标 heading 并规范层级
+    - 字号显著大于正文的短行 → heading（仅对 paragraph）
+    对 OpenDataLoader 已标的 heading 也会重新规范层级（其层级常混乱）。"""
+    # 该页正文众数字号（标题不算）
+    sizes = [el["fontSize"] for el in elements
+             if el["type"] != "heading" and isinstance(el.get("fontSize"), (int, float))]
+    body_size = max(set(sizes), key=sizes.count) if sizes else None
+
+    for el in elements:
+        if el["type"] not in ("paragraph", "heading"):
+            continue
+        text = el["text"].strip()
+        if not text or len(text) > 80:
+            continue
+        # 排除年份开头的正文行（"2023 年的研究"/"2023 The ..."），防误标标题
+        if re.match(r"^\s*\d{4}\s*年", text) or re.match(r"^\s*\d{4}\s+[A-Z]", text):
+            continue
+        m = _NUM_HEADING_RE.match(text)
+        if m:
+            # 正文段（含中文句号、或过长）不以数字开头当标题
+            if "。" in text or len(text) > 60:
+                continue
+            depth = m.group(1).count(".") + 1
+            first_word = m.group(2)
+            # 排除 "3 A A" / "4 2020" 类：编号后首词是单字符或纯数字 → 不是标题
+            if len(first_word) == 1 or first_word.isdigit():
+                continue
+            el["headingLevel"] = min(depth, 3)
+            el["type"] = "heading"
+            continue
+        if _CN_HEADING_RE.match(text):
+            el["headingLevel"] = 1
+            el["type"] = "heading"
+            continue
+        if _CAPS_HEADING_RE.match(text):
+            el["headingLevel"] = 1
+            el["type"] = "heading"
+            continue
+        # 非编号标题：短行 + 字号明显大于正文（≥1.2x）→ 章节标题（仅 paragraph）
+        if el["type"] != "paragraph":
+            continue
+        fs = el.get("fontSize")
+        if body_size and isinstance(fs, (int, float)) and fs >= body_size * 1.2:
+            if len(text) <= 30 and text[-1] not in _SENT_END:
+                el["headingLevel"] = 1
+                el["type"] = "heading"
+
+
+def _post_process(pages: dict[int, list[dict]], page_sizes: list[tuple[float, float]]) -> None:
+    """逐页应用：双栏重排 → 断句合并 → 标题增强（原地修改 pages）。"""
+    for i, (w, _h) in enumerate(page_sizes):
+        els = pages.get(i + 1)
+        if not els:
+            continue
+        if _is_two_column(els, w):
+            els = _reorder_two_column(els, w)
+        els = _merge_sentence_fragments(els)
+        _enhance_headings(els)
+        pages[i + 1] = els
 
 
 import io
