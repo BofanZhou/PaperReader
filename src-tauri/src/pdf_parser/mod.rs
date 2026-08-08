@@ -92,14 +92,14 @@ enum ScriptLine {
 // ========== 路径与工具 ==========
 
 /// papers 根目录（%APPDATA%/com.paperreader.app/papers）
-fn papers_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn papers_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app_data_dir(app)?.join("papers");
     fs::create_dir_all(&dir).map_err(|e| format!("创建 papers 目录失败: {}", e))?;
     Ok(dir)
 }
 
 /// 由 pdf 路径生成稳定 uuid（同一 PDF 复用缓存，避免重复解析）
-fn pdf_uuid(pdf_path: &str) -> String {
+pub(crate) fn pdf_uuid(pdf_path: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -282,15 +282,42 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
     let lock = lock_for(&uuid);
     let _guard = lock.lock().await;
 
-    // 1. 缓存：papers/{uuid}/parsed.json
+    // 1. papers/{uuid}/ 目录 + PDF 副本（工程补充文档 §2.1 [copying] + §4.1）
+    //    副本在缓存检查前复制：缓存命中时也要保证副本存在（源文件可能已被移动）。
+    //    幂等：副本已存在则跳过。
     let paper_dir = papers_dir(&app)?.join(&uuid);
     fs::create_dir_all(&paper_dir).map_err(|e| e.to_string())?;
+    let work_dir = paper_dir.join("work");
+    let original_pdf = paper_dir.join("original.pdf");
+    if !original_pdf.exists() {
+        fs::copy(&pdf_path, &original_pdf).map_err(|e| format!("复制 PDF 副本失败: {}", e))?;
+    }
+    // 解析统一用副本（源路径仅用于 uuid 计算，保持不变）
+    let parse_source = if original_pdf.exists() {
+        original_pdf.to_string_lossy().to_string()
+    } else {
+        pdf_path.clone()
+    };
+
+    // 2. 缓存：papers/{uuid}/parsed.json
     let out_json = paper_dir.join("parsed.json");
     if out_json.exists() {
         // 缓存反序列化失败时降级重新解析（Python/Rust 字段命名变化时会触发）。
         // 只有序列化成功才直接返回，避免被旧缓存卡住。
         if let Ok(raw) = fs::read_to_string(&out_json) {
-            if let Ok(result) = serde_json::from_str::<ParsedResult>(&raw) {
+            if let Ok(mut result) = serde_json::from_str::<ParsedResult>(&raw) {
+                // 旧版本缓存里 imageSrc 可能是相对 work_dir 的路径（如 _images/x.png）。
+                // 补全为绝对路径，保证前端 convertFileSrc 能加载。
+                for page in &mut result.pages {
+                    for el in &mut page.elements {
+                        if let Some(src) = &el.image_src {
+                            let p = Path::new(src);
+                            if !p.is_absolute() {
+                                el.image_src = Some(work_dir.join(src).to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
                 return Ok(result);
             }
             // 旧缓存格式不匹配，丢弃并重新解析
@@ -317,25 +344,24 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
 
     // 3. 构造命令：python parse_pdf.py <pdf> <paper_dir> <work_dir>
     let script = script_path(&app)?;
-    let work_dir = paper_dir.join("work");
     fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
 
     let mut cmd = python.command();
     cmd.arg(&script)
-        .arg(&pdf_path)
+        .arg(&parse_source)
         .arg(&paper_dir)
         .arg(&work_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // 4. 启动 + 进度/错误收集
+    // 5. 启动 + 进度/错误收集
     let mut child = cmd.spawn().map_err(|e| format!("启动解析失败: {}", e))?;
     let stdout = child.stdout.take().ok_or("无法获取子进程 stdout")?;
     let stderr = child.stderr.take().ok_or("无法获取子进程 stderr")?;
     let (stdout_error, _stdout_rx) = spawn_stdout_reader(app.clone(), stdout);
     let stderr_buf = spawn_stderr_collector(stderr);
 
-    // 5. 等待完成（含超时）
+    // 6. 等待完成（含超时）
     let started = Instant::now();
     let status = loop {
         if started.elapsed() > PARSE_TIMEOUT {
@@ -349,7 +375,7 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
         }
     };
 
-    // 6. 失败处理：优先使用 stdout ERROR 行的完整 traceback，stderr / ERROR.log 作补充
+    // 7. 失败处理：优先使用 stdout ERROR 行的完整 traceback，stderr / ERROR.log 作补充
     if !status.success() {
         let mut detail = stdout_error.lock().unwrap().take().unwrap_or_default();
         if detail.is_empty() {

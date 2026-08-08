@@ -52,32 +52,38 @@ export function SelectionPopup({
   const ref = useRef<HTMLDivElement | null>(null);
   const [pos, setPos] = useState({ left: selection.x, top: selection.y });
 
-  // 弹窗位置：限制在容器内，必要时翻转（选中在下方 → 弹窗放上方）
+  // 弹窗位置：对齐工程补充文档 §9 定位算法
+  // 首选：选区上方（避免遮挡正在读的文本）；上方空间不足才放下方；
+  // 水平方向相对选区居中，并限制在阅读容器内（不覆盖侧边栏）。
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
     const w = el.offsetWidth || 300;
     const h = el.offsetHeight || 120;
     const rect = containerRect;
-    let left = selection.x;
-    let top = selection.y + POPUP_GAP; // 默认在选区下方
+    // 选区在 PDFViewer 内的坐标（selection.x/y 是页面绝对坐标）
+    let left = selection.x + (selection.width ?? 0) / 2 - w / 2;
+    let top = selection.y - h - POPUP_GAP; // 首选上方
 
     if (rect) {
-      // 水平方向不越界（不覆盖侧边栏）
-      if (left + w > rect.right - 8) left = rect.right - w - 8;
-      if (left < rect.left + 8) left = rect.left + 8;
-      // 垂直方向：下方放不下就翻到上方
-      if (top + h > rect.bottom - 8) {
-        top = selection.y - h - POPUP_GAP;
+      // 上方放不下 → 翻到选区下方
+      if (top < rect.top + 8) {
+        top = selection.y + (selection.height ?? 0) + POPUP_GAP;
       }
-      if (top < rect.top + 8) top = rect.top + 8;
+      // 水平居中，限容器内
+      left = Math.max(rect.left + 8, left);
+      left = Math.min(left, rect.right - w - 8);
+      // 垂直兜底：仍超界就夹在容器内
+      top = Math.max(rect.top + 8, top);
+      if (top + h > rect.bottom - 8) top = rect.bottom - h - 8;
     } else {
       left = Math.max(8, left);
       if (left + w > window.innerWidth - 8) left = window.innerWidth - w - 8;
+      if (top < 8) top = selection.y + POPUP_GAP;
       if (top + h > window.innerHeight - 8) top = window.innerHeight - h - 8;
     }
     setPos({ left, top });
-  }, [selection.x, selection.y, containerRect, translation, expanded]);
+  }, [selection.x, selection.y, selection.width, selection.height, containerRect, translation, expanded]);
 
   // Esc 关闭
   useEffect(() => {
@@ -94,7 +100,8 @@ export function SelectionPopup({
   return (
     <div
       ref={ref}
-      className="fixed z-40 overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-[0_8px_32px_rgba(0,0,0,0.18)]"
+      className="selection-popup fixed z-40 overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-[0_8px_32px_rgba(0,0,0,0.18)]"
+      data-testid="selection-popup"
       style={{ left: pos.left, top: pos.top, width: "auto", maxWidth: MAX_WIDTH }}
       onMouseDown={(e) => e.stopPropagation()}
     >

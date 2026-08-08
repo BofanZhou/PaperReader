@@ -24,6 +24,7 @@
 import glob
 import json
 import os
+import re
 import sys
 import traceback
 
@@ -127,6 +128,105 @@ def table_to_text(el: dict) -> str:
     return "\n".join(lines)
 
 
+def list_to_text(el: dict) -> str:
+    """将 OpenDataLoader list 结构转为文本（每条 list item 独占一行）
+
+    参考文献列表被识别为 list 类型时，容器本身的 content 为 None，
+    真实内容在 list items[*].content（以及它们自身的 kids[*].content）。
+    之前没递归提取，导致参考文献页全部为空。
+    """
+    parts: list[str] = []
+    for item in el.get("list items", []) or []:
+        text = item.get("content")
+        if text:
+            parts.append(text)
+        # list item 自身可能是多段（跨行/跨栏），用 kids 把每段也加进来
+        for kid in item.get("kids", []) or []:
+            ktext = kid.get("content")
+            if ktext:
+                parts.append(ktext)
+    return "\n".join(parts)
+
+
+# ========== 噪声过滤（页眉/页脚/版权/脚注/logo） ==========
+#
+# OpenDataLoader 会把期刊页眉、页脚版权、通讯作者脚注、期刊 logo 等当成普通
+# 元素输出，导致正文被"页眉-正文-页脚-版权"穿插，阅读体验很差。这些元素
+# 有稳定的内容模式 / 位置特征，在此统一过滤。
+
+# 内容模式（小写匹配，强规则：命中即丢弃）
+_NOISE_PATTERNS = [
+    # 英文论文：版权 / 期刊页眉 / 脚注
+    r"all rights reserved",
+    r"see front matter",
+    r"journal homepage",
+    r"sciencedirect",
+    r"contents lists available",
+    r"corresponding author",
+    r"issn\s*[:：]",
+    r"copyright\s*©|©",
+    r"\(c\)\s*20\d\d",
+    r"tel\.?\s*[:：]",
+    r"fax\s*[:：]",
+    r"e-?mail\s*address",
+    r"e-?mail\s*[:：]\s*\S+@",      # E-mail: xxx@yyy（无 address 字样也命中）
+    r"^\s*\d+\s*$",                # 纯页码
+    r"pii\s*[:：]",
+    r"doi\s*[:：]",
+    # 中文学位/期刊论文：首页底部作者脚注特征
+    r"收稿日期",
+    r"修回日期",
+    r"基金项目",
+    r"作者简介",
+    r"通讯作者",
+    r"编辑部网址",
+    r"引用格式[：:]",
+    r"^\s*[\*◆●]\s*[收稿作通]",  # 脚注开头标记（* 收稿 / * 作者简介 等）
+]
+
+# 图片：小于该尺寸（pt）视为 logo / 装饰碎片
+_LOGO_MAX_DIM = 100
+
+
+def _is_noise(el: dict, page_h: float) -> bool:
+    """判断单个元素是否为页眉/页脚/版权/脚注/logo 等噪声。"""
+    etype = el.get("type")
+    bbox = el.get("bounding box") or [0.0, 0.0, 0.0, 0.0]
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    top_y = bbox[3]
+    bottom_y = bbox[1]
+    text = (el.get("content") or "").strip()
+
+    # 1. 图片：小尺寸 → logo / 装饰碎片
+    if etype == "image":
+        return w < _LOGO_MAX_DIM or h < _LOGO_MAX_DIM
+
+    # 2. 空文本的非图像、非表格、非列表元素（list / paragraph 无内容）→ 丢弃
+    #    注意：table / list 元素没有 content（数据在 rows / list items 里），
+    #    不能按此规则过滤，否则参考文献页会全部丢空
+    if not text and etype not in ("table", "list"):
+        return True
+
+    low = text.lower()
+
+    # 3. 内容模式（强规则）
+    if any(re.search(p, low) for p in _NOISE_PATTERNS):
+        return True
+
+    # 4. 位置弱规则（顶部/底部边缘 + 短文本 → 页眉页脚）
+    if page_h > 0:
+        if top_y > page_h * 0.93 and len(text) < 90:
+            return True
+        if bottom_y < page_h * 0.05 and len(text) < 90:
+            return True
+        # 顶部区域的短标题型页眉（如期刊名被识别成 heading）
+        if top_y > page_h * 0.85 and etype in ("heading", "paragraph") and len(text) < 60:
+            return True
+
+    return False
+
+
 def _safe_int(value, default=None):
     """OpenDataLoader 的 heading level / page number 等字段类型不稳定（可能是
     int / float / str / None），统一转 int，失败时返回 default。"""
@@ -138,13 +238,21 @@ def _safe_int(value, default=None):
         return default
 
 
-def convert(raw: dict, page_sizes: list[tuple[float, float]]) -> dict:
-    """OpenDataLoader 原始 JSON → PaperReader 内部格式"""
+def convert(raw: dict, page_sizes: list[tuple[float, float]], work_dir: str) -> dict:
+    """OpenDataLoader 原始 JSON → PaperReader 内部格式
+
+    work_dir 用于把 image 元素的 source（相对 _images/ 的路径）补全为绝对路径，
+    前端 convertFileSrc 可直接加载。
+    """
     pages: dict[int, list[dict]] = {}
     reading_order = 0
     for el in raw.get("kids", []):
         page_num = _safe_int(el.get("page number"), default=1) or 1
         if page_num < 1:
+            continue
+        # 噪声过滤：页眉/页脚/版权/脚注/logo 不进入阅读视图
+        page_h = page_sizes[page_num - 1][1] if page_num - 1 < len(page_sizes) else 0
+        if _is_noise(el, page_h):
             continue
         bbox = el.get("bounding box") or [0.0, 0.0, 0.0, 0.0]
         etype = TYPE_MAP.get(el.get("type", "paragraph"), "paragraph")
@@ -152,8 +260,16 @@ def convert(raw: dict, page_sizes: list[tuple[float, float]]) -> dict:
         text = el.get("content") or ""
         if el.get("type") == "table":
             text = table_to_text(el)
-        # 图片元素：记录图片源文件（相对 work_dir 的 _images/ 目录）
-        img_src = el.get("source") if el.get("type") == "image" else None
+        elif el.get("type") == "list":
+            # 参考文献等列表内容在 list items[*]，容器 content 经常为空
+            text = list_to_text(el) or text
+        # 图片元素：source 是相对 work_dir 的路径（如 _images/xxx.png），
+        # 补全为绝对路径，前端 convertFileSrc 才能加载。
+        img_src = None
+        if el.get("type") == "image":
+            src = el.get("source")
+            if src:
+                img_src = os.path.abspath(os.path.join(work_dir, src))
 
         pages.setdefault(page_num, []).append(
             {
@@ -235,6 +351,8 @@ def run_opendataloader(pdf_path: str, work_dir: str, force_ocr: bool = False) ->
         "output_dir": work_dir,
         "format": "json",
         "quiet": True,
+        # cluster = 边框 + 聚类检测，能识别无边框表格（default 只认有边框的）
+        "table_method": "cluster",
     }
     if force_ocr:
         kwargs["force_ocr"] = True
@@ -307,7 +425,7 @@ def main() -> int:
 
         # 4. 转换为内部格式
         progress("converting", 85, "整理版面元素")
-        result = convert(raw, page_sizes)
+        result = convert(raw, page_sizes, work_dir)
 
         # 5. 写入 parsed.json
         out_path = os.path.join(output_dir, "parsed.json")

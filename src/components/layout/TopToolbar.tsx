@@ -6,6 +6,7 @@ import {
   Sun,
   Zap,
 } from "lucide-react";
+import { useState } from "react";
 import { Button } from "../ui/button";
 import {
   Select,
@@ -22,6 +23,7 @@ import {
 import { cn } from "../../lib/utils";
 import { MODELS, useAppStore, type ViewMode } from "../../store/appStore";
 import type { Theme } from "../../hooks/useTheme";
+import { SettingsDialog } from "../settings/SettingsDialog";
 
 const VIEW_MODES: { id: ViewMode; label: string }[] = [
   { id: "original", label: "原文" },
@@ -36,7 +38,9 @@ interface Props {
 }
 
 export function TopToolbar({ theme, onToggleTheme, onOpenFile }: Props) {
-  const { viewMode, setViewMode, model, setModel, currentFile } = useAppStore();
+  const { viewMode, setViewMode, model, setModel, currentFile, runTranslate, translateState } = useAppStore();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const translating = translateState === "translating";
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-bg px-3">
@@ -87,8 +91,8 @@ export function TopToolbar({ theme, onToggleTheme, onOpenFile }: Props) {
           </SelectContent>
         </Select>
 
-        <Button size="sm" disabled={!currentFile} aria-label="翻译当前论文">
-          <Zap aria-hidden /> 翻译
+        <Button size="sm" disabled={!currentFile || translating} onClick={() => runTranslate().catch(() => {})} aria-label="翻译当前论文">
+          <Zap aria-hidden /> {translating ? "翻译中…" : "翻译"}
         </Button>
 
         <Tooltip>
@@ -102,13 +106,15 @@ export function TopToolbar({ theme, onToggleTheme, onOpenFile }: Props) {
 
         <Tooltip>
           <TooltipTrigger asChild>
-            <Button variant="ghost" size="icon" onClick={() => {}} aria-label="设置">
+            <Button variant="ghost" size="icon" onClick={() => setSettingsOpen(true)} aria-label="设置">
               <Settings aria-hidden />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>设置（即将上线）</TooltipContent>
+          <TooltipContent>设置</TooltipContent>
         </Tooltip>
       </div>
+
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </header>
   );
 }

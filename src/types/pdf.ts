@@ -47,6 +47,9 @@ export interface SelectionState {
   /** 屏幕坐标（固定定位用） */
   x: number;
   y: number;
+  /** 选区尺寸（px，弹窗定位用） */
+  width?: number;
+  height?: number;
   /** 选中的纯文本 */
   text: string;
   /** 命中元素 id（可能跨元素，取第一个） */
@@ -68,8 +71,6 @@ export interface Translation {
 
 /** PDFViewer 渲染 props */
 export interface PDFViewerProps {
-  /** 本地 PDF 绝对路径（Tauri）或 http(s) URL */
-  pdfUrl: string;
   /** 解析结果（含页面尺寸 + 元素） */
   result: ParsedResult;
   mode: ViewMode;

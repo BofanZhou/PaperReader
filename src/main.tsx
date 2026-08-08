@@ -3,6 +3,26 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./index.css";
 
+// 全局错误/日志脱敏（工程补充文档 §5.3 敏感数据处理）
+// API Key 形如 sk-xxx...，任何被带到 console / 错误上报的内容都替换掉，
+// 防止开发者工具或日志文件泄露 Key。
+function redactSensitive(text: string): string {
+  return text.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***");
+}
+
+window.addEventListener("error", (e) => {
+  if (e.error?.stack) {
+    e.error.stack = redactSensitive(String(e.error.stack));
+  }
+});
+
+const originalWarn = console.warn;
+const originalError = console.error;
+console.warn = (...args: unknown[]) =>
+  originalWarn(...args.map((a) => (typeof a === "string" ? redactSensitive(a) : a)));
+console.error = (...args: unknown[]) =>
+  originalError(...args.map((a) => (typeof a === "string" ? redactSensitive(a) : a)));
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <App />

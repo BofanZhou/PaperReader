@@ -38,4 +38,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Sensitive / local-only config
+# API Key 本体只存系统凭据管理器（keyring），settings.json 仅含模型选择。
+# 以下规则为防御性：防止未来误把本地配置/密钥文件放进仓库。
+settings.json
+*.key
+*.pem
+secrets.*
+.env.local
+
 

@@ -3,6 +3,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
   BookOpen,
+  CheckCircle2,
   FileText,
   FolderOpen,
   Loader2,
@@ -13,6 +14,7 @@ import { Progress } from "../ui/progress";
 import { Sidebar } from "./Sidebar";
 import { useAppStore } from "../../store/appStore";
 import { getLastParseLog } from "../../lib/env";
+import { chatCompletion } from "../../lib/ai";
 import { PDFViewer } from "../pdf/PDFViewer";
 import { SelectionPopup } from "../pdf/SelectionPopup";
 import type {
@@ -48,8 +50,19 @@ function friendlyParseError(err: string): { title: string; desc: string } {
 
 /** 主体工作区：左侧 PDF 阅读区 + 右侧可拖拽侧边栏 */
 export function Workspace({ onOpenFile }: Props) {
-  const { currentFile, parseState, parseProgress, parsedResult, parseError, runParse, viewMode } =
-    useAppStore();
+  const {
+    currentFile,
+    parseState,
+    parseProgress,
+    parsedResult,
+    parseError,
+    runParse,
+    viewMode,
+    translations,
+    translateState,
+    translateProgress,
+    translateError,
+  } = useAppStore();
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT);
   const dragging = useRef(false);
   const parsedFileRef = useRef<string | null>(null);
@@ -97,8 +110,15 @@ export function Workspace({ onOpenFile }: Props) {
           <ParsingView fileName={fileName(currentFile)} progress={parseProgress} />
         ) : parseState === "error" ? (
           <ErrorView fileName={fileName(currentFile)} error={parseError} onRetry={() => runParse().catch(() => {})} onOpenFile={onOpenFile} />
-        ) : parsedResult && currentFile ? (
-          <ReaderView result={parsedResult} pdfPath={currentFile} viewMode={viewMode} />
+        ) : parsedResult ? (
+          <ReaderView
+            result={parsedResult}
+            viewMode={viewMode}
+            translations={translations}
+            translateState={translateState}
+            translateProgress={translateProgress}
+            translateError={translateError}
+          />
         ) : (
           <EmptyHome onOpenFile={onOpenFile} />
         )}
@@ -150,7 +170,7 @@ function EmptyHome({ onOpenFile }: { onOpenFile: () => void }) {
 /** 解析中 */
 function ParsingView({ fileName, progress }: { fileName: string; progress: { percent: number; message: string } | null }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-5 p-8">
+    <div data-testid="parsing-progress" className="flex h-full flex-col items-center justify-center gap-5 p-8">
       <div className="flex items-center gap-2 text-sm font-medium">
         <Loader2 className="size-5 animate-spin text-accent" aria-hidden />
         正在解析 {fileName}
@@ -215,15 +235,21 @@ function ErrorView({ fileName, error, onRetry, onOpenFile }: { fileName: string;
   );
 }
 
-/** 阅读视图（Prompt 3）：PDF.js 渲染 + 选中即翻译浮动弹窗 */
+/** 阅读视图（Prompt 3/4）：纯 DOM 文字阅读 + 图表原位置 + 选中即翻译浮动弹窗 */
 function ReaderView({
   result,
-  pdfPath,
   viewMode,
+  translations,
+  translateState,
+  translateProgress,
+  translateError,
 }: {
   result: import("../../lib/env").ParsedResult;
-  pdfPath: string;
   viewMode: "original" | "translated" | "bilingual";
+  translations: Record<string, string> | null;
+  translateState: "idle" | "translating" | "error" | "success";
+  translateProgress: import("../../lib/ai").TranslateProgress | null;
+  translateError: string | null;
 }) {
   const areaRef = useRef<HTMLDivElement | null>(null);
   const [containerRect, setContainerRect] = useState<DOMRect | null>(null);
@@ -249,15 +275,21 @@ function ReaderView({
     setTranslation(null);
   }, []);
 
-  // 翻译 stub：Prompt 4 接入真实翻译引擎前，先返回占位（保留完整交互链路）
+  // 选中即翻译（单段，真实调用；整篇翻译走顶部按钮）
   const handleTranslate = useCallback(async (text: string, lang: TargetLang) => {
     setTranslating(true);
     try {
-      await new Promise((r) => setTimeout(r, 500));
-      setTranslation({
-        target: lang,
-        text: `【译文待接入 · Prompt 4 翻译引擎】\n${text}`,
-      });
+      const langName = { zh: "中文", en: "英文", ja: "日文" }[lang];
+      const res = await chatCompletion(
+        `把以下论文文本翻译为${langName}，只输出译文，不要解释：\n\n${text}`,
+        {
+          system: "你是一位专业的学术论文翻译专家。译文忠实原文、术语准确、保留学术语气。",
+          modelId: "deepseek-v4-flash",
+        },
+      );
+      setTranslation({ target: lang, text: res.text });
+    } catch (e) {
+      setTranslation({ target: lang, text: `翻译失败：${e}` });
     } finally {
       setTranslating(false);
     }
@@ -328,10 +360,35 @@ function ReaderView({
 
   return (
     <div ref={areaRef} className="relative h-full overflow-hidden">
+      {/* 译文/对照模式但尚未翻译 → 顶部提示条 */}
+      {viewMode !== "original" && translateState === "idle" && !translations && (
+        <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-accent-subtle px-4 py-1.5 text-xs text-accent">
+          <span>尚未翻译全文，点击顶部「⚡ 翻译」按钮生成整篇译文</span>
+        </div>
+      )}
+      {viewMode !== "original" && translateState === "translating" && (
+        <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-accent-subtle px-4 py-1.5 text-xs text-accent">
+          <Loader2 className="size-3.5 animate-spin" aria-hidden />
+          <span>{translateProgress?.message ?? "正在翻译…"}</span>
+        </div>
+      )}
+      {viewMode !== "original" && translateState === "error" && (
+        <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-error/10 px-4 py-1.5 text-xs text-error">
+          <AlertTriangle className="size-3.5" aria-hidden />
+          <span className="max-w-[80%] truncate">翻译失败：{translateError ?? "未知错误"}</span>
+        </div>
+      )}
+      {viewMode !== "original" && translateState === "success" && (
+        <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-success/10 px-4 py-1.5 text-xs text-success">
+          <CheckCircle2 className="size-3.5" aria-hidden />
+          <span>{translateProgress?.message ?? "翻译完成"}</span>
+        </div>
+      )}
+
       <PDFViewer
-        pdfUrl={pdfPath}
         result={result}
         mode={viewMode}
+        translations={translations ?? undefined}
         highlights={highlights}
         onSelectText={handleSelectText}
         onContextMenuAction={handleContextMenuAction}

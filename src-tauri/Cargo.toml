@@ -32,6 +32,10 @@ zip = "2"
 futures-util = "0.3"
 tokio = { version = "1", features = ["time", "sync"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# 必须启用 windows-native！keyring 3.x 在 Windows 上若未启用该 feature，
+# 会退回 mock 后端（纯内存、不持久化）——写入"成功"但重启即失。
+# 启用后使用 Windows Credential Manager 真实存储。
+keyring = { version = "3", features = ["windows-native"] }
 
 [profile.release]
 panic = "abort"
