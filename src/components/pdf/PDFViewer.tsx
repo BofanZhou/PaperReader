@@ -56,37 +56,55 @@ function ElementBlock({ el, displayText, highlight, onSelect, onContext }: Block
 
   const hlStyle = highlight ? { backgroundColor: `${highlight}55`, boxShadow: `inset 0 0 0 1.5px ${highlight}` } : undefined;
 
-  // 图片：保留原位置展示
+  // 图片：卡片化展示，保留原位置
   if (el.type === "figure" && el.imageSrc) {
     return (
       <figure
         {...common}
-        className="my-3 flex flex-col items-center gap-1"
+        className="my-4 flex flex-col items-center gap-2 rounded-xl border border-border bg-bg-secondary/40 p-3 shadow-sm"
         style={hlStyle}
       >
         <img
           src={convertFileSrc(el.imageSrc)}
           alt={displayText || "figure"}
-          className="max-h-[420px] max-w-full rounded border border-border object-contain"
+          className="max-h-[420px] max-w-full rounded object-contain"
           draggable={false}
           loading="lazy"
+          onError={(e) => {
+            e.currentTarget.style.display = "none";
+          }}
         />
-        {displayText && <figcaption className="text-center text-xs text-fg-tertiary">{displayText}</figcaption>}
+        {displayText && (
+          <figcaption className="max-w-full px-1 text-center text-xs leading-relaxed text-fg-tertiary">
+            {displayText}
+          </figcaption>
+        )}
       </figure>
     );
   }
 
-  // 表格：文本行 → HTML 表格
+  // 表格：卡片化 + 表头行 + 斑马纹
   if (el.type === "table") {
     const rows = tableRows(displayText);
     return (
-      <div {...common} className="my-3 overflow-x-auto rounded-md border border-border bg-bg-secondary/60" style={hlStyle}>
+      <div {...common} className="my-4 overflow-x-auto rounded-xl border border-border bg-bg-secondary/40 shadow-sm" style={hlStyle}>
         <table className="w-full border-collapse text-[13px] leading-relaxed">
+          {rows.length > 0 && (
+            <thead>
+              <tr>
+                {rows[0].map((c, j) => (
+                  <th key={j} className="border-b border-border bg-bg-tertiary/60 px-2.5 py-1.5 text-left font-semibold">
+                    {c}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+          )}
           <tbody>
-            {rows.map((cells, i) => (
-              <tr key={i} className={i === 0 ? "bg-bg-tertiary/50 font-medium" : undefined}>
+            {rows.slice(1).map((cells, i) => (
+              <tr key={i} className={i % 2 === 1 ? "bg-bg-tertiary/30" : undefined}>
                 {cells.map((c, j) => (
-                  <td key={j} className="border-b border-border/60 px-2 py-1 align-top">
+                  <td key={j} className="border-b border-border/60 px-2.5 py-1.5 align-top">
                     {c}
                   </td>
                 ))}
@@ -98,16 +116,17 @@ function ElementBlock({ el, displayText, highlight, onSelect, onContext }: Block
     );
   }
 
-  // 标题：按 headingLevel 放大加粗
+  // 标题：按 headingLevel 分级（字号梯度 + 段前间距 + 深浅层次）
   if (el.type === "heading") {
     const level = Math.min(4, Math.max(1, el.headingLevel ?? 1));
-    const sizes = ["text-2xl", "text-xl", "text-lg", "text-base"];
+    const headingCls = [
+      "my-4 text-[22px] font-bold leading-snug text-fg",          // H1
+      "my-3.5 text-[19px] font-semibold leading-snug text-fg",    // H2
+      "my-3 text-[16px] font-semibold leading-snug text-fg",      // H3
+      "my-2.5 text-[14.5px] font-semibold leading-snug text-fg-secondary", // H4
+    ];
     return (
-      <div
-        {...common}
-        className={`my-2.5 font-semibold text-fg ${sizes[level - 1] ?? "text-base"}`}
-        style={hlStyle}
-      >
+      <div {...common} className={headingCls[level - 1] ?? "my-2.5 font-semibold text-fg"} style={hlStyle}>
         {displayText}
       </div>
     );
@@ -123,7 +142,7 @@ function ElementBlock({ el, displayText, highlight, onSelect, onContext }: Block
   }
   if (el.type === "formula") {
     return (
-      <div {...common} className="my-2 overflow-x-auto text-center font-mono text-sm leading-relaxed text-fg" style={hlStyle}>
+      <div {...common} className="my-2 overflow-x-auto rounded-md bg-bg-secondary/40 px-3 py-2 text-center font-mono text-sm leading-relaxed text-fg" style={hlStyle}>
         {displayText}
       </div>
     );
@@ -169,8 +188,10 @@ function PageSection({
 
   return (
     <section className="mx-auto mb-6 w-full max-w-[780px] rounded-lg border border-border bg-bg px-6 py-5 shadow-sm">
-      <header className="mb-3 border-b border-border/60 pb-2 text-center">
-        <span className="text-xs font-medium tracking-wide text-fg-tertiary">第 {page.pageNumber} 页</span>
+      <header className="mb-4 flex items-center justify-center gap-3">
+        <span className="h-px flex-1 bg-border/60" aria-hidden />
+        <span className="text-[11px] font-medium tracking-widest text-fg-tertiary">第 {page.pageNumber} 页</span>
+        <span className="h-px flex-1 bg-border/60" aria-hidden />
       </header>
       {sorted.map((el) =>
         // 空文本元素（解析兜底遗留）不渲染
