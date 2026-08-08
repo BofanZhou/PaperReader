@@ -175,8 +175,16 @@ _NOISE_PATTERNS = [
     r"e-?mail\s*address",
     r"e-?mail\s*[:：]\s*\S+@",      # E-mail: xxx@yyy（无 address 字样也命中）
     r"^\s*\d+\s*$",                # 纯页码
+    r"^\s*第\s*\d+\s*页\s*$",      # 中文页码页眉（第 2 页）
     r"pii\s*[:：]",
     r"doi\s*[:：]",
+    # Elsevier 文章信息块（article info）
+    r"article history",
+    r"received in revised form",
+    r"available online",
+    r"^received\s+\d+\s+\S+",      # Received 9 September 2011
+    r"accepted\s+\d+\s+\S+",
+    r"^\s*(?:[A-Za-z]\s+){4,}[A-Za-z]\s*$",  # 字母空格装饰（a b s t r a c t）
     # 中文学位/期刊论文：首页底部作者脚注特征
     r"收稿日期",
     r"修回日期",
@@ -500,12 +508,67 @@ def _enhance_headings(elements: list[dict]) -> None:
                 el["type"] = "heading"
 
 
+def _table_has_content(text: str) -> bool:
+    """表格是否含实际内容（' |  | ' 这种分隔符+空单元格不算）。"""
+    return any(c.strip() for c in text.split("|"))
+
+
+def _rebuild_empty_tables(elements: list[dict]) -> list[dict]:
+    """修复 OpenDataLoader 表格空壳：
+    1. 若能按 bbox 从同页散落段落重组出内容 → 填入表格；
+    2. 若表格 bbox 内无内容且无散落文本可并入（引擎空壳/误判）→ 丢弃空表格
+       （内容本来就在段落流里，保留段落即不丢内容，同时避免前端渲染空表格占位）。
+    行 = top 聚类（相邻 top 差显著大则切行），列 = 行内按 left 排序。"""
+    paragraphs = [el for el in elements if el["type"] == "paragraph"]
+    out: list[dict] = []
+    used_ids: set[str] = set()
+    for el in elements:
+        if el["type"] != "table" or _table_has_content(el["text"]):
+            out.append(el)
+            continue
+        if not paragraphs:
+            continue  # 无可重建来源 → 丢弃空壳表格
+        b = el["bbox"]
+        inside = [
+            p for p in paragraphs
+            if p["id"] not in used_ids
+            and b["left"] <= (p["bbox"]["left"] + p["bbox"]["right"]) / 2 <= b["right"]
+            and b["bottom"] <= (p["bbox"]["bottom"] + p["bbox"]["top"]) / 2 <= b["top"]
+        ]
+        if not inside:
+            continue  # bbox 内无散落文本 → 空壳/误判，丢弃
+        # 行聚类：top 降序（页面上→下），相邻 gap 显著大则新行
+        inside_sorted = sorted(inside, key=lambda p: p["bbox"]["top"], reverse=True)
+        tops = [p["bbox"]["top"] for p in inside_sorted]
+        gaps = [tops[i] - tops[i + 1] for i in range(len(tops) - 1)]
+        median_gap = sorted(gaps)[len(gaps) // 2] if gaps else 12.0
+        row_threshold = max(median_gap * 2, 10)
+        rows: list[list[dict]] = [[inside_sorted[0]]]
+        for p in inside_sorted[1:]:
+            if rows[-1][-1]["bbox"]["top"] - p["bbox"]["top"] > row_threshold:
+                rows.append([p])
+            else:
+                rows[-1].append(p)
+        lines = []
+        for row in rows:
+            row_sorted = sorted(row, key=lambda p: p["bbox"]["left"])
+            lines.append(" | ".join(p["text"].strip() for p in row_sorted))
+        el["text"] = "\n".join(lines)
+        used_ids.update(p["id"] for p in inside)
+        out.append(el)
+    # 移除被并入表格的段落
+    if used_ids:
+        out = [el for el in out if not (el["type"] == "paragraph" and el["id"] in used_ids)]
+    return out
+
+
 def _post_process(pages: dict[int, list[dict]], page_sizes: list[tuple[float, float]]) -> None:
-    """逐页应用：双栏重排 → 断句合并 → 标题增强（原地修改 pages）。"""
+    """逐页应用：表格空壳重建 → 双栏重排 → 断句合并 → 标题增强（原地修改 pages）。"""
     for i, (w, _h) in enumerate(page_sizes):
         els = pages.get(i + 1)
         if not els:
             continue
+        els = _rebuild_empty_tables(els)
         if _is_two_column(els, w):
             els = _reorder_two_column(els, w)
         els = _merge_sentence_fragments(els)
