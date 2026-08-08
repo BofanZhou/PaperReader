@@ -47,6 +47,8 @@ interface BlockProps {
 
 /** 单个元素块：按类型渲染（标题/段落/图注/公式/图片/表格） */
 function ElementBlock({ el, displayText, highlight, onSelect, onContext }: BlockProps) {
+  // 图片加载失败标记（hooks 必须无条件调用）
+  const [imgFailed, setImgFailed] = useState(false);
   const common = {
     "data-pd-el": el.id,
     "data-pd-type": el.type,
@@ -58,22 +60,31 @@ function ElementBlock({ el, displayText, highlight, onSelect, onContext }: Block
 
   // 图片：卡片化展示，保留原位置
   if (el.type === "figure" && el.imageSrc) {
+    const imgUrl = convertFileSrc(el.imageSrc);
     return (
       <figure
         {...common}
         className="my-4 flex flex-col items-center gap-2 rounded-xl border border-border bg-bg-secondary/40 p-3 shadow-sm"
         style={hlStyle}
       >
-        <img
-          src={convertFileSrc(el.imageSrc)}
-          alt={displayText || "figure"}
-          className="max-h-[420px] max-w-full rounded object-contain"
-          draggable={false}
-          loading="lazy"
-          onError={(e) => {
-            e.currentTarget.style.display = "none";
-          }}
-        />
+        {imgFailed ? (
+          <div className="py-6 text-center text-xs text-error">
+            图片加载失败
+            <div className="mt-1 break-all font-mono text-[10px] text-fg-tertiary">{el.imageSrc}</div>
+          </div>
+        ) : (
+          <img
+            src={imgUrl}
+            alt={displayText || "figure"}
+            className="max-h-[420px] max-w-full rounded object-contain"
+            draggable={false}
+            loading="lazy"
+            onError={() => {
+              console.error("[PDFViewer] 图片加载失败:", el.imageSrc, "→", imgUrl);
+              setImgFailed(true);
+            }}
+          />
+        )}
         {displayText && (
           <figcaption className="max-w-full px-1 text-center text-xs leading-relaxed text-fg-tertiary">
             {displayText}
