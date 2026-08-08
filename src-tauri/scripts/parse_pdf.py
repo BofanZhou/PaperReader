@@ -25,7 +25,11 @@ import glob
 import json
 import os
 import re
+import shutil
+import socket
+import subprocess
 import sys
+import time
 import traceback
 
 import opendataloader_pdf
@@ -337,6 +341,74 @@ class _NullStdout:
         return False
 
 
+# ========== hybrid（docling-fast 后端）进程管理 ==========
+#
+# hybrid 模式 = 本地 Java 快速处理简单页 + 复杂页（扫描/表格/公式）路由到
+# docling-fast AI 后端，基准测试准确率显著高于纯 Java（表格 0.49→0.93）。
+# 后端是常驻 HTTP 服务（默认 localhost:5002），首次调用需下载模型。
+#
+# 启动要点（Windows 实战验证）：
+#   1. OCR 引擎用 tesseract（本机已装 + chi_sim/eng 语言包），避免 easyocr 大模型下载
+#   2. 后端进程必须注入 tesseract 目录到 PATH（anaconda python 的 PATH 里没有）
+#   3. HF_ENDPOINT 指向 hf-mirror.com —— 国内网络直连 huggingface.co 超时，
+#      docling 首次转换会从 HF 下载版面模型（几分钟，之后走本地缓存）
+
+HYBRID_PORT = 5002
+HF_ENDPOINT = "https://hf-mirror.com"
+
+
+def _backend_alive(port: int) -> bool:
+    """探测后端 TCP 端口是否可连（不等于初始化完成，但够用）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.8)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def ensure_hybrid_backend() -> bool:
+    """确保 docling hybrid 后端在跑；未跑则启动并等待就绪。
+    返回 True = 本次新启动了后端（调用方可用于进度提示）。"""
+    if _backend_alive(HYBRID_PORT):
+        return False
+
+    # 注入运行环境：tesseract PATH + HF 镜像
+    env = os.environ.copy()
+    tess_dir = r"C:\Program Files\Tesseract-OCR"
+    if os.path.isdir(tess_dir) and tess_dir not in env.get("PATH", ""):
+        env["PATH"] = tess_dir + ";" + env.get("PATH", "")
+    env.setdefault("HF_ENDPOINT", HF_ENDPOINT)
+
+    # 后端可执行：优先 PATH，否则用当前 Python 同目录 Scripts（anaconda 布局）
+    hy = shutil.which("opendataloader-pdf-hybrid")
+    if not hy:
+        scripts = os.path.join(os.path.dirname(sys.executable), "Scripts")
+        cand = os.path.join(scripts, "opendataloader-pdf-hybrid.exe")
+        if os.path.exists(cand):
+            hy = cand
+    if not hy:
+        raise RuntimeError("未找到 opendataloader-pdf-hybrid，请先 pip install 'opendataloader-pdf[hybrid]'")
+
+    # detached 常驻启动（不随本脚本退出）；stdout/stderr 丢弃
+    DETACHED = 0x00000008 | 0x00000200
+    subprocess.Popen(
+        [hy, "--port", str(HYBRID_PORT), "--ocr-engine", "tesseract",
+         "--ocr-lang", "chi_sim,eng", "--log-level", "warning"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=DETACHED, close_fds=True,
+    )
+    # 轮询就绪（后端初始化 + 首次模型下载可能较久，放宽到 180s）
+    for _ in range(90):
+        if _backend_alive(HYBRID_PORT):
+            return True
+        time.sleep(2)
+    raise RuntimeError("hybrid 后端启动超时（首次使用需联网下载模型，请重试）")
+
+
 def run_opendataloader(pdf_path: str, work_dir: str, force_ocr: bool = False) -> None:
     """调用 OpenDataLoader 解析；force_ocr 用于扫描版 fallback。
 
@@ -346,6 +418,10 @@ def run_opendataloader(pdf_path: str, work_dir: str, force_ocr: bool = False) ->
     OSError: [Errno 22] Invalid argument —— 这是当前解析失败的根因。
     quiet 模式下 JAR 输出在内部被读取并丢弃，生成结果仍写到 output_dir 文件。
     """
+    # hybrid 全局启用（用户决策）：docling 后端增强复杂页提取
+    started_new = ensure_hybrid_backend()
+    if started_new:
+        progress("parsing", 12, "hybrid 后端启动中（首次使用需联网下载模型，可能等待 1-5 分钟）")
     kwargs = {
         "input_path": [pdf_path],
         "output_dir": work_dir,
@@ -353,6 +429,10 @@ def run_opendataloader(pdf_path: str, work_dir: str, force_ocr: bool = False) ->
         "quiet": True,
         # cluster = 边框 + 聚类检测，能识别无边框表格（default 只认有边框的）
         "table_method": "cluster",
+        # 路由复杂页（扫描/表格/公式）到 docling-fast 后端
+        "hybrid": "docling-fast",
+        # 后端异常时回退纯 Java 解析（单点故障不致命）
+        "hybrid_fallback": True,
     }
     if force_ocr:
         kwargs["force_ocr"] = True
