@@ -2,13 +2,11 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./index.css";
+import { redactSensitive } from "./lib/utils";
 
 // 全局错误/日志脱敏（工程补充文档 §5.3 敏感数据处理）
 // API Key 形如 sk-xxx...，任何被带到 console / 错误上报的内容都替换掉，
-// 防止开发者工具或日志文件泄露 Key。
-function redactSensitive(text: string): string {
-  return text.replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-***");
-}
+// 防止开发者工具或日志文件泄露 Key。实现统一在 lib/utils.ts redactSensitive。
 
 window.addEventListener("error", (e) => {
   if (e.error?.stack) {

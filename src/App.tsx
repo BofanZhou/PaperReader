@@ -31,8 +31,13 @@ function Splash() {
 
 function App() {
   const { theme, toggleTheme } = useTheme();
-  const { setCurrentFile } = useAppStore();
+  const { setCurrentFile, loadModels } = useAppStore();
   const [phase, setPhase] = useState<Phase>("checking");
+
+  // 启动即加载模型列表（P6 单源化：模型配置来自 Rust default_models()）
+  useEffect(() => {
+    void loadModels();
+  }, [loadModels]);
 
   // 首次启动：检测环境（优先使用缓存）
   useEffect(() => {

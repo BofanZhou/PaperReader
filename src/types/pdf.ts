@@ -9,15 +9,23 @@ import type { Bbox, ElementType, ParsedResult, ParsedElement, ParsedPage } from 
 
 export type { Bbox, ElementType, ParsedResult, ParsedElement, ParsedPage };
 
-/** 三种阅读视图模式 */
-export type ViewMode = "original" | "translated" | "bilingual";
+/** 阅读视图模式：pdf-original（pdfjs 原图）/ restructured（AI 重排，规划中）/ translated（译文）/ bilingual（对照） */
+export type ViewMode = "pdf-original" | "restructured" | "translated" | "bilingual";
 
-/** 高亮颜色（PaperMind 风格） */
+/**
+ * 高亮颜色（Engineering Supplement §1.2 设计系统，P2-2 对齐）
+ *
+ * 6 分类语义 id + 亮/暗双主题值。色值由 index.css 的 --hl-* CSS 变量提供
+ * （单一来源，主题切换自动生效）；此处引用变量而非硬编码 Hex。
+ * 半透明渲染（高亮底色）用 color-mix 基于该变量生成。
+ */
 export const HIGHLIGHT_COLORS = [
-  { id: "yellow", hex: "#FFD700", label: "黄色" },
-  { id: "green", hex: "#90EE90", label: "绿色" },
-  { id: "blue", hex: "#87CEEB", label: "蓝色" },
-  { id: "red", hex: "#FFB6C1", label: "红色" },
+  { id: "insight", label: "洞察", cssVar: "var(--hl-insight)" },
+  { id: "question", label: "疑问", cssVar: "var(--hl-question)" },
+  { id: "conclusion", label: "结论", cssVar: "var(--hl-conclusion)" },
+  { id: "method", label: "方法", cssVar: "var(--hl-method)" },
+  { id: "experiment", label: "实验", cssVar: "var(--hl-experiment)" },
+  { id: "to-read", label: "待读", cssVar: "var(--hl-to-read)" },
 ] as const;
 
 export type HighlightColorId = (typeof HIGHLIGHT_COLORS)[number]["id"];

@@ -82,11 +82,19 @@ const JAVA_DOWNLOAD_URL: &str =
 const PYTHON_DOWNLOAD_URL: &str =
     "https://mirrors.huaweicloud.com/python/3.11.9/python-3.11.9-embed-amd64.zip";
 
-// get-pip 国内镜像（清华）
-const GET_PIP_URL: &str = "https://mirrors.tuna.tsinghua.edu.cn/pypa/get-pip.py";
+// get-pip 国内镜像（华为云；原清华 pypa/get-pip.py 路径已 404）
+const GET_PIP_URL: &str = "https://mirrors.huaweicloud.com/pypi/get-pip.py";
 
 // PyPI 国内镜像
 const PYPI_MIRROR: &str = "https://mirrors.huaweicloud.com/repository/pypi/simple";
+
+// ========== 下载完整性（P7：SHA-256 校验） ==========
+//
+// 版本固定的压缩包（jre.zip / python embed zip）内容不可变，pin 住 SHA-256，
+// 防镜像被篡改/传输损坏。get-pip.py 是"移动目标"（随 pip 发布更新），
+// 无法 pin，仅做 size 校验（download 内已有）。
+const JRE_ZIP_SHA256: &str = "b2208206bda47f2e0c971a39e057a5ec32c40b503d71e486790cb728d926b615";
+const PYTHON_ZIP_SHA256: &str = "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b";
 
 // ========== 命令执行工具 ==========
 
@@ -334,6 +342,37 @@ pub(crate) fn pick_python(app: &AppHandle) -> Option<CmdLine> {
     None
 }
 
+/// pick_python 的进程级 TTL 缓存（代码审查 P4：避免每次解析都探测 python 子进程）
+static PYTHON_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, Option<CmdLine>)>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn pick_python_cached(app: &AppHandle, ttl: Duration) -> Option<CmdLine> {
+    let cache = PYTHON_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((at, p)) = guard.as_ref() {
+            if at.elapsed() < ttl {
+                return p.clone();
+            }
+        }
+    }
+    let picked = pick_python(app);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), picked.clone()));
+    }
+    picked
+}
+
+/// 清空环境检测 / python 选择缓存（安装完成后调用，保证下次解析看到最新状态）
+pub(crate) fn clear_env_caches() {
+    if let Ok(mut guard) = ENV_CACHE.get_or_init(|| std::sync::Mutex::new(None)).lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = PYTHON_CACHE.get_or_init(|| std::sync::Mutex::new(None)).lock() {
+        *guard = None;
+    }
+}
+
 /// 检测 OpenDataLoader（使用当前可用的 python）
 fn detect_opendataloader(app: &AppHandle) -> ComponentStatus {
     let Some(python) = pick_python(app) else {
@@ -364,13 +403,47 @@ fn detect_opendataloader(app: &AppHandle) -> ComponentStatus {
     }
 }
 
-/// 对外命令：检测环境
+/// 实际检测逻辑（不做缓存）
+fn check_environment_impl(app: &AppHandle) -> Result<EnvironmentReport, String> {
+    let java = detect_java(app);
+    let python = detect_python(app);
+    let opendataloader = detect_opendataloader(app);
+    Ok(EnvironmentReport::new(java, python, opendataloader))
+}
+
+/// 进程级环境检测缓存（TTL 内复用）。
+///
+/// 代码审查 P4：parse_pdf 每次解析都调 check_environment → 每次 spawn
+/// java -version / python --version / opendataloader 版本探测（数百 ms）。
+/// 引入带 TTL 的进程级缓存，解析路径高频调用不再重复探测；
+/// 用户主动点「环境管理」走命令（fresh），install 完成后也强制走 fresh。
+static ENV_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::time::Instant, EnvironmentReport)>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn check_environment_cached(
+    app: &AppHandle,
+    ttl: Duration,
+) -> Result<EnvironmentReport, String> {
+    let cache = ENV_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((at, report)) = guard.as_ref() {
+            if at.elapsed() < ttl {
+                return Ok(report.clone());
+            }
+        }
+    }
+    let report = check_environment_impl(app)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), report.clone()));
+    }
+    Ok(report)
+}
+
+/// 对外命令：检测环境（用户主动触发，始终 fresh）
 #[tauri::command]
 pub fn check_environment(app: AppHandle) -> Result<EnvironmentReport, String> {
-    let java = detect_java(&app);
-    let python = detect_python(&app);
-    let opendataloader = detect_opendataloader(&app);
-    Ok(EnvironmentReport::new(java, python, opendataloader))
+    check_environment_impl(&app)
 }
 
 /// 对外命令：安装指定组件（"java" | "python" | "opendataloader" | "all"）
@@ -396,19 +469,41 @@ pub async fn install_component(app: AppHandle, component: String) -> Result<Envi
         other => return Err(format!("未知组件: {}", other)),
     }
 
-    // 安装完成后返回最新环境报告
+    // 安装完成后清空进程级缓存（环境检测 / python 选择），
+    // 并返回最新环境报告（fresh，不走缓存）
+    clear_env_caches();
     check_environment(app)
 }
 
 // ========== 下载与安装工具 ==========
 
-/// 下载文件到本地路径（带重试 + 进度事件）
+/// 流式计算文件 SHA-256（hex 小写），大文件不整读进内存
+fn sha256_hex(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|e| format!("打开文件计算校验和失败: {}", e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| format!("读取文件计算校验和失败: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// 下载文件到本地路径（带重试 + 进度事件 + 可选 SHA-256 校验）
 async fn download(
     app: &AppHandle,
     component: &str,
     url: &str,
     dest: &Path,
     label: &str,
+    expected_sha256: Option<&str>,
 ) -> Result<(), String> {
     const MAX_RETRIES: u32 = 3;
     let temp_dir = dest.parent().ok_or("无效下载路径")?;
@@ -426,10 +521,7 @@ async fn download(
             },
         );
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("创建下载客户端失败: {}", e))?;
+        let client = crate::net::download_client();
 
         let res = client.get(url).send().await;
         match res {
@@ -489,7 +581,7 @@ async fn download(
                 file.flush().map_err(|e| format!("刷新文件失败: {}", e))?;
 
                 if ok {
-                    // 简单校验文件大小
+                    // 校验 1：文件大小（服务端给了 content-length 时）
                     if total > 0 {
                         let actual = fs::metadata(dest)
                             .map_err(|e| format!("读取文件元信息失败: {}", e))?
@@ -497,6 +589,18 @@ async fn download(
                         if actual != total {
                             last_err = format!("下载 {} 大小不匹配: {} / {}", label, actual, total);
                             continue;
+                        }
+                    }
+                    // 校验 2：SHA-256（版本固定文件必须匹配，不匹配即视为失败，不重试——
+                    // 持续不匹配说明镜像内容已变化，重试只会反复下载大文件）
+                    if let Some(expected) = expected_sha256 {
+                        let actual = sha256_hex(dest)?;
+                        if !actual.eq_ignore_ascii_case(expected) {
+                            let _ = fs::remove_file(dest);
+                            return Err(format!(
+                                "{} 校验和不匹配（文件可能已损坏或镜像内容已更新）\n期望: {}\n实际: {}",
+                                label, expected, actual
+                            ));
                         }
                     }
                     return Ok(());
@@ -585,7 +689,7 @@ async fn install_java(app: &AppHandle) -> Result<(), String> {
     let zip_path = temp.join(JRE_ZIP_NAME);
     let extract_to = temp.join(JRE_EXTRACT_DIR);
 
-    download(app, "java", JAVA_DOWNLOAD_URL, &zip_path, "Java JRE 17").await?;
+    download(app, "java", JAVA_DOWNLOAD_URL, &zip_path, "Java JRE 17", Some(JRE_ZIP_SHA256)).await?;
 
     emit_progress(
         app,
@@ -657,7 +761,7 @@ async fn install_python(app: &AppHandle) -> Result<(), String> {
     let getpip = temp.join("get-pip.py");
     let py_exe = py_dir.join("python.exe");
 
-    download(app, "python", PYTHON_DOWNLOAD_URL, &zip_path, "Python 3.11.9").await?;
+    download(app, "python", PYTHON_DOWNLOAD_URL, &zip_path, "Python 3.11.9", Some(PYTHON_ZIP_SHA256)).await?;
 
     emit_progress(
         app,
@@ -698,7 +802,8 @@ async fn install_python(app: &AppHandle) -> Result<(), String> {
             message: "安装 pip ...".into(),
         },
     );
-    download(app, "python", GET_PIP_URL, &getpip, "pip").await?;
+    // get-pip.py 是动态文件（随 pip 版本更新），无法 pin 校验和，仅 size 校验
+    download(app, "python", GET_PIP_URL, &getpip, "pip", None).await?;
 
     let cmd = CmdLine::new(py_exe.to_string_lossy().to_string(), vec![]);
     let output = cmd
@@ -772,13 +877,21 @@ async fn install_opendataloader(app: &AppHandle) -> Result<(), String> {
         },
     );
 
-    let mut cmd = python.command();
-    cmd.args([
-        "-m", "pip", "install",
-        "-i", PYPI_MIRROR,
-        "-U", "opendataloader-pdf[hybrid]",
-    ]);
-    let output = cmd.output().map_err(|e| format!("pip 执行失败: {}", e))?;
+    // pip install 可能耗时数分钟，不能在 async 运行时线程上同步阻塞
+    // （代码审查 P4：阻塞 std::process::output 会卡住整个 async runtime）。
+    let cmd_line = python.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = cmd_line.command();
+        cmd.args([
+            "-m", "pip", "install",
+            "-i", PYPI_MIRROR,
+            "-U", "opendataloader-pdf[hybrid]",
+        ]);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| format!("pip 任务失败: {}", e))?
+    .map_err(|e| format!("pip 执行失败: {}", e))?;
     if !output.status.success() {
         return Err(format!(
             "opendataloader-pdf[hybrid] 安装失败: {}",

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
@@ -15,7 +16,10 @@ import { Sidebar } from "./Sidebar";
 import { useAppStore } from "../../store/appStore";
 import { getLastParseLog } from "../../lib/env";
 import { chatCompletion } from "../../lib/ai";
+import { cn } from "../../lib/utils";
 import { PDFViewer } from "../pdf/PDFViewer";
+import { PDFOriginalView } from "../pdf/PDFOriginalView";
+import { RestructuredView } from "../pdf/RestructuredView";
 import { SelectionPopup } from "../pdf/SelectionPopup";
 import type {
   ContextMenuAction,
@@ -65,17 +69,9 @@ export function Workspace({ onOpenFile }: Props) {
   } = useAppStore();
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT);
   const dragging = useRef(false);
-  const parsedFileRef = useRef<string | null>(null);
 
-  // currentFile 变化 → 自动解析
-  useEffect(() => {
-    if (currentFile && parsedFileRef.current !== currentFile) {
-      parsedFileRef.current = currentFile;
-      runParse().catch(() => {
-        /* 错误已写入 store */
-      });
-    }
-  }, [currentFile, runParse]);
+  // 说明：解析由 store.setCurrentFile 统一触发（含竞态防护与状态清空），
+  // 这里不再重复监听 currentFile 调 runParse，避免同一文件被解析两次。
 
   const onDragStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -245,7 +241,7 @@ function ReaderView({
   translateError,
 }: {
   result: import("../../lib/env").ParsedResult;
-  viewMode: "original" | "translated" | "bilingual";
+  viewMode: "pdf-original" | "restructured" | "translated" | "bilingual";
   translations: Record<string, string> | null;
   translateState: "idle" | "translating" | "error" | "success";
   translateProgress: import("../../lib/ai").TranslateProgress | null;
@@ -254,10 +250,33 @@ function ReaderView({
   const areaRef = useRef<HTMLDivElement | null>(null);
   const [containerRect, setContainerRect] = useState<DOMRect | null>(null);
   const [selection, setSelection] = useState<SelectionState | null>(null);
-  const [activeColor, setActiveColor] = useState<HighlightColorId>("yellow");
+  const [activeColor, setActiveColor] = useState<HighlightColorId>("insight");
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [translation, setTranslation] = useState<{ target: TargetLang; text: string } | null>(null);
   const [translating, setTranslating] = useState(false);
+  // 原图视图：解析副本 original.pdf 路径（pdfjs 渲染用）
+  const [originalPdfPath, setOriginalPdfPath] = useState<string | null>(null);
+  // 对照模式左栏 source（原图 或 AI 重排）
+  const [leftSource, setLeftSource] = useState<"pdf-original" | "restructured">("pdf-original");
+
+  // 原图视图下获取 papers/{uuid}/original.pdf（源文件可能已移动，副本始终存在）
+  useEffect(() => {
+    if (viewMode !== "pdf-original" && !(viewMode === "bilingual" && leftSource === "pdf-original")) return;
+    let cancelled = false;
+    const file = useAppStore.getState().currentFile;
+    if (!file) return;
+    setOriginalPdfPath(null);
+    invoke<string>("get_paper_pdf_path", { pdfPath: file })
+      .then((p) => {
+        if (!cancelled) setOriginalPdfPath(p);
+      })
+      .catch(() => {
+        if (!cancelled) setOriginalPdfPath(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewMode, leftSource]);
 
   // 阅读区边界（弹窗不覆盖侧边栏）
   useEffect(() => {
@@ -275,6 +294,8 @@ function ReaderView({
     setTranslation(null);
   }, []);
 
+  const { model } = useAppStore();
+
   // 选中即翻译（单段，真实调用；整篇翻译走顶部按钮）
   const handleTranslate = useCallback(async (text: string, lang: TargetLang) => {
     setTranslating(true);
@@ -284,7 +305,8 @@ function ReaderView({
         `把以下论文文本翻译为${langName}，只输出译文，不要解释：\n\n${text}`,
         {
           system: "你是一位专业的学术论文翻译专家。译文忠实原文、术语准确、保留学术语气。",
-          modelId: "deepseek-v4-flash",
+          // 用用户当前选择的模型（不再硬编码 deepseek-v4-flash）
+          modelId: model,
         },
       );
       setTranslation({ target: lang, text: res.text });
@@ -293,7 +315,7 @@ function ReaderView({
     } finally {
       setTranslating(false);
     }
-  }, []);
+  }, [model]);
 
   const handleHighlight = useCallback(
     (colorId: HighlightColorId) => {
@@ -360,39 +382,106 @@ function ReaderView({
 
   return (
     <div ref={areaRef} className="relative h-full overflow-hidden">
-      {/* 译文/对照模式但尚未翻译 → 顶部提示条 */}
-      {viewMode !== "original" && translateState === "idle" && !translations && (
+      {/* 译文/对照模式但尚未翻译 → 顶部提示条（原图/原文视图不显示） */}
+      {(viewMode === "translated" || viewMode === "bilingual") && translateState === "idle" && !translations && (
         <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-accent-subtle px-4 py-1.5 text-xs text-accent">
           <span>尚未翻译全文，点击顶部「⚡ 翻译」按钮生成整篇译文</span>
         </div>
       )}
-      {viewMode !== "original" && translateState === "translating" && (
+      {(viewMode === "translated" || viewMode === "bilingual") && translateState === "translating" && (
         <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-accent-subtle px-4 py-1.5 text-xs text-accent">
           <Loader2 className="size-3.5 animate-spin" aria-hidden />
           <span>{translateProgress?.message ?? "正在翻译…"}</span>
         </div>
       )}
-      {viewMode !== "original" && translateState === "error" && (
+      {(viewMode === "translated" || viewMode === "bilingual") && translateState === "error" && (
         <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-error/10 px-4 py-1.5 text-xs text-error">
           <AlertTriangle className="size-3.5" aria-hidden />
           <span className="max-w-[80%] truncate">翻译失败：{translateError ?? "未知错误"}</span>
         </div>
       )}
-      {viewMode !== "original" && translateState === "success" && (
+      {(viewMode === "translated" || viewMode === "bilingual") && translateState === "success" && (
         <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 bg-success/10 px-4 py-1.5 text-xs text-success">
           <CheckCircle2 className="size-3.5" aria-hidden />
           <span>{translateProgress?.message ?? "翻译完成"}</span>
         </div>
       )}
 
-      <PDFViewer
-        result={result}
-        mode={viewMode}
-        translations={translations ?? undefined}
-        highlights={highlights}
-        onSelectText={handleSelectText}
-        onContextMenuAction={handleContextMenuAction}
-      />
+      {viewMode === "pdf-original" ? (
+        originalPdfPath ? (
+          <PDFOriginalView
+            pdfPath={originalPdfPath}
+            onSelectText={handleSelectText}
+            onContextMenuAction={handleContextMenuAction}
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center text-xs text-fg-tertiary">
+            正在获取原图…
+          </div>
+        )
+      ) : viewMode === "restructured" ? (
+        <RestructuredView pdfPath={useAppStore.getState().currentFile ?? ""} />
+      ) : viewMode === "bilingual" ? (
+        <div className="flex h-full">
+          {/* 左栏：原图 或 AI 重排（toggle） */}
+          <div className="relative flex-1 border-r border-border">
+            {leftSource === "pdf-original" ? (
+              originalPdfPath ? (
+                <PDFOriginalView
+                  pdfPath={originalPdfPath}
+                  onSelectText={handleSelectText}
+                  onContextMenuAction={handleContextMenuAction}
+                />
+              ) : (
+                <div className="flex h-full items-center justify-center text-xs text-fg-tertiary">正在获取原图…</div>
+              )
+            ) : (
+              <RestructuredView pdfPath={useAppStore.getState().currentFile ?? ""} />
+            )}
+            {/* 左栏 source 切换（绝对定位浮在顶部） */}
+            <div className="absolute left-1/2 top-2 z-10 -translate-x-1/2 rounded-full border border-border bg-bg-secondary/95 px-1 py-0.5 text-xs shadow-sm backdrop-blur">
+              <button
+                onClick={() => setLeftSource("pdf-original")}
+                className={cn(
+                  "rounded-full px-2.5 py-0.5 transition-colors",
+                  leftSource === "pdf-original" ? "bg-accent text-fg-inverse" : "text-fg-secondary hover:text-fg",
+                )}
+              >
+                原图
+              </button>
+              <button
+                onClick={() => setLeftSource("restructured")}
+                className={cn(
+                  "rounded-full px-2.5 py-0.5 transition-colors",
+                  leftSource === "restructured" ? "bg-accent text-fg-inverse" : "text-fg-secondary hover:text-fg",
+                )}
+              >
+                AI 重排
+              </button>
+            </div>
+          </div>
+          {/* 右栏：译文 */}
+          <div className="flex-1">
+            <PDFViewer
+              result={result}
+              mode="translated"
+              translations={translations ?? undefined}
+              highlights={highlights}
+              onSelectText={handleSelectText}
+              onContextMenuAction={handleContextMenuAction}
+            />
+          </div>
+        </div>
+      ) : (
+        <PDFViewer
+          result={result}
+          mode="translated"
+          translations={translations ?? undefined}
+          highlights={highlights}
+          onSelectText={handleSelectText}
+          onContextMenuAction={handleContextMenuAction}
+        />
+      )}
 
       {selection && (
         <SelectionPopup

@@ -79,16 +79,22 @@ export const streamChat = async (
   onChunk: (delta: string) => void,
   opts?: { system?: string; modelId?: string },
 ): Promise<{ cancel: () => void }> => {
-  const unlisten = await listen<string>("ai-chunk", (e) => onChunk(e.payload));
+  // cancel 后不再向回调投递任何增量/错误（原实现仅 unlisten，迟到的 chunk 仍会回调）
+  let cancelled = false;
+  const emit = (delta: string) => {
+    if (!cancelled) onChunk(delta);
+  };
+  const unlisten = await listen<string>("ai-chunk", (e) => emit(e.payload));
   // 触发流式请求（不 await 完成，事件驱动）
   invoke<ChatResult>("chat_completion", {
     prompt,
     system: opts?.system ?? null,
     modelId: opts?.modelId ?? "deepseek-v4-flash",
     stream: true,
-  }).catch((e) => onChunk(`\n[错误] ${e}`));
+  }).catch((e) => emit(`\n[错误] ${e}`));
   return {
     cancel: () => {
+      cancelled = true;
       unlisten();
     },
   };
@@ -128,3 +134,31 @@ export const translatePaper = (
 /** 订阅翻译进度事件 */
 export const onTranslateProgress = (cb: (p: TranslateProgress) => void): Promise<UnlistenFn> =>
   listen<TranslateProgress>("translate-progress", (event) => cb(event.payload));
+
+// ========== AI 重排（Prompt 4 §9-14，Phase 1） ==========
+
+export interface RestructureProgress {
+  stage: string; // prepare | calling | done
+  percent: number;
+  message: string;
+}
+
+export interface RestructuredDoc {
+  markdown: string;
+  figureCount: number;
+  promptTokens: number;
+  estimatedCostUsd: number;
+  generatedAt: string;
+}
+
+/** 读取 AI 重排产物（不存在返回 NOT_FOUND 错误） */
+export const getRestructuredDoc = (pdfPath: string): Promise<string> =>
+  invoke<string>("get_restructured_doc", { pdfPath });
+
+/** 执行 AI 重排（force=true 强制重新生成） */
+export const aiRestructure = (pdfPath: string, force?: boolean): Promise<RestructuredDoc> =>
+  invoke<RestructuredDoc>("ai_restructure", { pdfPath, force: force ?? false });
+
+/** 订阅 AI 重排进度事件 */
+export const onRestructureProgress = (cb: (p: RestructureProgress) => void): Promise<UnlistenFn> =>
+  listen<RestructureProgress>("restructure-progress", (event) => cb(event.payload));

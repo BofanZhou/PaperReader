@@ -314,6 +314,8 @@ def convert(raw: dict, page_sizes: list[tuple[float, float]], work_dir: str) -> 
         for el in pages.get(p + 1, []):
             el["readingOrder"] = order
             order += 1
+        # 保证每页元素严格按 readingOrder 输出，便于前端/重排模块统一图序
+        pages.get(p + 1, []).sort(key=lambda e: e["readingOrder"])
 
     result = {
         "pdfPath": raw.get("file name", ""),

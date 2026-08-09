@@ -21,12 +21,13 @@ import {
   TooltipTrigger,
 } from "../ui/tooltip";
 import { cn } from "../../lib/utils";
-import { MODELS, useAppStore, type ViewMode } from "../../store/appStore";
+import { useAppStore, type ViewMode } from "../../store/appStore";
 import type { Theme } from "../../hooks/useTheme";
 import { SettingsDialog } from "../settings/SettingsDialog";
 
 const VIEW_MODES: { id: ViewMode; label: string }[] = [
-  { id: "original", label: "原文" },
+  { id: "pdf-original", label: "原图" },
+  { id: "restructured", label: "AI 重排" },
   { id: "translated", label: "译文" },
   { id: "bilingual", label: "对照" },
 ];
@@ -38,7 +39,7 @@ interface Props {
 }
 
 export function TopToolbar({ theme, onToggleTheme, onOpenFile }: Props) {
-  const { viewMode, setViewMode, model, setModel, currentFile, runTranslate, translateState } = useAppStore();
+  const { viewMode, setViewMode, model, setModel, models, currentFile, runTranslate, translateState } = useAppStore();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const translating = translateState === "translating";
 
@@ -78,18 +79,27 @@ export function TopToolbar({ theme, onToggleTheme, onOpenFile }: Props) {
 
       {/* 右侧：模型选择 + 翻译 + 设置 + 主题 */}
       <div className="flex items-center gap-2">
-        <Select value={model} onValueChange={(v) => setModel(v as typeof model)}>
-          <SelectTrigger className="h-8 w-44 text-xs" aria-label="选择翻译模型">
-            <SelectValue placeholder="选择翻译模型" />
-          </SelectTrigger>
-          <SelectContent>
-            {MODELS.map((m) => (
-              <SelectItem key={m.id} value={m.id}>
-                {m.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {models.length > 0 ? (
+          <Select value={model} onValueChange={(v) => setModel(v)}>
+            <SelectTrigger className="h-8 w-44 text-xs" aria-label="选择翻译模型">
+              <SelectValue placeholder="选择翻译模型" />
+            </SelectTrigger>
+            <SelectContent>
+              {models.map((m) => (
+                <SelectItem key={m.id} value={m.id}>
+                  {m.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : (
+          <div
+            className="h-8 w-44 rounded-md border border-border bg-bg-tertiary/50 px-3 py-1.5 text-xs text-fg-tertiary"
+            title="模型列表加载中"
+          >
+            加载模型…
+          </div>
+        )}
 
         <Button size="sm" disabled={!currentFile || translating} onClick={() => runTranslate().catch(() => {})} aria-label="翻译当前论文">
           <Zap aria-hidden /> {translating ? "翻译中…" : "翻译"}

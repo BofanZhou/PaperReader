@@ -1,6 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { AlertTriangle, RotateCcw } from "lucide-react";
 import { Button } from "./ui/button";
+import { redactSensitive } from "../lib/utils";
 
 interface Props {
   children: ReactNode;
@@ -36,7 +37,8 @@ export class ErrorBoundary extends Component<Props, State> {
           <div>
             <p className="text-base font-medium">应用出错了</p>
             <p className="mt-1 max-w-md text-sm text-fg-secondary">
-              {this.state.error?.message ?? "未知错误"}
+              {/* P3-10：渲染路径也要脱敏（console 已脱敏，此处补 UI 展示） */}
+              {this.state.error?.message ? redactSensitive(this.state.error.message) : "未知错误"}
             </p>
           </div>
           <Button

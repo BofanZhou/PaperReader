@@ -3,6 +3,8 @@
 mod ai;
 mod cleanup;
 mod env_manager;
+mod net;
+mod ocr;
 mod pdf_parser;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -24,6 +26,9 @@ pub fn run() {
             env_manager::install_component,
             pdf_parser::parse_pdf,
             pdf_parser::get_last_parse_log,
+            pdf_parser::get_paper_pdf_path,
+            pdf_parser::get_restructured_doc,
+            pdf_parser::read_image_base64,
             ai::get_ai_config,
             ai::save_ai_config,
             ai::save_api_key,
@@ -31,6 +36,8 @@ pub fn run() {
             ai::test_connection,
             ai::chat_completion,
             ai::translate::translate_paper,
+            ai::restructure::ai_restructure,
+            ocr::ocr_page_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

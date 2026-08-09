@@ -31,6 +31,7 @@ import {
   type ModelConfig,
   type ProviderKeyStatus,
 } from "../../lib/ai";
+import { useAppStore } from "../../store/appStore";
 
 interface Props {
   open: boolean;
@@ -124,6 +125,8 @@ export function SettingsDialog({ open, onOpenChange }: Props) {
     setConfig({ ...config, defaultModel: modelId });
     try {
       await saveAiConfig(modelId);
+      // 同步工具栏当前模型（保持"默认模型"与"当前选择"一致）
+      useAppStore.getState().setModel(modelId);
     } catch (e) {
       setTestResult({ provider: "system", ok: false, msg: String(e) });
     }

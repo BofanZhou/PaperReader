@@ -42,7 +42,7 @@ pub struct TranslateResult {
     pub cache_hit_tokens: u64,
 }
 
-// ========== token 估算（规格 §4：中文≈1.5 tok/字，英文≈1.3 tok/字） ==========
+// ========== token 估算（规格 §4：中文≈1.5 tok/字，英文≈1.3 tok/词） ==========
 
 fn is_cjk(ch: char) -> bool {
     let c = ch as u32;
@@ -52,7 +52,9 @@ fn is_cjk(ch: char) -> bool {
 fn estimate_tokens(text: &str) -> usize {
     let cjk = text.chars().filter(|&c| is_cjk(c)).count();
     let other = text.chars().count().saturating_sub(cjk);
-    (cjk as f64 * 1.5 + other as f64 * 0.8) as usize // 英文按 ~0.8 tok/字符（含空格）粗估
+    // 中文 ≈1.5 tok/字；英文 ≈1.3 tok/词 ≈ 0.3 tok/字符（平均 ~4 字符/token）。
+    // 原实现用 0.8 tok/字符（≈3.2 tok/词）高估约 2.7 倍 → 分批过碎、调用次数过多。
+    (cjk as f64 * 1.5 + other as f64 * 0.3) as usize
 }
 
 /// 目标语言 → System Prompt 里的语言描述
@@ -101,24 +103,30 @@ fn extract_items(result: &serde_json::Value) -> Vec<TranslateItem> {
 
 // ========== 模型调用（非流式，返回完整文本 + usage） ==========
 
-#[derive(Debug, Default, Clone, Copy)]
-struct ModelUsage {
-    prompt_tokens: u64,
-    cache_hit_tokens: u64,
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ModelUsage {
+    pub(crate) prompt_tokens: u64,
+    pub(crate) cache_hit_tokens: u64,
+    /// choices[0].finish_reason（"stop" | "length" | ...），重排用它检测截断
+    pub(crate) finish_reason: String,
 }
 
 /// 支持多条消息（[system] + [固定 user 前缀] + [每批内容]），
 /// 前缀固定 → DeepSeek 前缀缓存命中（价格约 10 倍便宜）。
-async fn call_model(
+/// pub(crate)：翻译 / AI 重排共用（ai/restructure.rs 引用）。
+/// `temperature`：Some(t) 覆盖模型默认温度（AI 重排用 0.7 让每次生成有差异；
+/// 翻译传 None 保持 0.2 确定性，保证译文稳定）。
+pub(crate) async fn call_model(
     model_id: &str,
     messages: Vec<(String, String)>,
     max_tokens: Option<u32>,
+    temperature: Option<f64>,
 ) -> Result<(String, ModelUsage), String> {
     let model = super::model_by_id(model_id).ok_or_else(|| format!("未知模型: {}", model_id))?;
     let key = keychain_get(&model.provider)?
         .ok_or_else(|| format!("KEY_NOT_SET:{}", model.provider))?;
 
-    let client = reqwest::Client::new();
+    let client = crate::net::ai_client();
     let url = format!("{}/chat/completions", model.base_url);
     let body_messages: Vec<serde_json::Value> = messages
         .iter()
@@ -128,8 +136,9 @@ async fn call_model(
         "model": model.api_model,
         "messages": body_messages,
         "stream": false,
-        // 温度按模型配置（Kimi for Coding 强制 1，DeepSeek 用 0.2）
-        "temperature": model.temperature,
+        // 温度：调用方可覆盖（AI 重排 0.7）；默认按模型配置
+        // （Kimi for Coding 强制 1，DeepSeek 用 0.2）
+        "temperature": temperature.unwrap_or(model.temperature),
     });
     // 显式输出上限：不设时服务商用默认值（通常 4096/8192），
     // 大批次译文容易超限被硬截断 → JSON 损坏。
@@ -157,12 +166,19 @@ async fn call_model(
     // 缓存命中字段名各服务略有差异：DeepSeek 用 prompt_cache_hit_tokens，
     // Kimi 等可能用 cache_hit_tokens / prompt_cache_hit_tokens，逐个兼容。
     let u = &json["usage"];
+    // finish_reason：AI 重排用它检测"输出被 max_tokens 硬截断"（内容缺失根因）
+    let finish_reason = json["choices"]
+        .get(0)
+        .and_then(|c| c["finish_reason"].as_str())
+        .unwrap_or("")
+        .to_string();
     let usage = ModelUsage {
         prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
         cache_hit_tokens: u["prompt_cache_hit_tokens"]
             .as_u64()
             .or_else(|| u["cache_hit_tokens"].as_u64())
             .unwrap_or(0),
+        finish_reason,
     };
     Ok((super::extract_text(&json), usage))
 }
@@ -407,12 +423,15 @@ struct TranslationCache {
     translations: HashMap<String, String>,
 }
 
+/// 缓存失效用 hash：SHA-256 前 32 位十六进制。
+/// 不用 DefaultHasher——其算法不保证跨 Rust 版本稳定，换编译器后旧缓存全部失效。
 fn simple_hash(s: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    hex[..32].to_string()
 }
 
 fn cache_path(app: &AppHandle, uuid: &str, model_id: &str, lang: &str) -> Result<std::path::PathBuf, String> {
@@ -420,6 +439,27 @@ fn cache_path(app: &AppHandle, uuid: &str, model_id: &str, lang: &str) -> Result
 }
 
 // ========== 对外命令 ==========
+
+/// 同一论文的并发翻译互斥锁（P3-2 防御）。
+///
+/// 前端 translating 状态已防重复触发，但 Rust 命令本身可被并发调用
+/// （快速双击 / 多窗口），并发会竞争写 translations_{model}_{lang}.json。
+/// 按 uuid 分桶加锁，保证同一论文同时只有一个翻译任务在跑。
+static TRANSLATE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn translate_lock_for(uuid: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let map = TRANSLATE_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // 锁毒化时兜底为独立锁（不 panic）
+    let Ok(mut map) = map.lock() else {
+        return std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    };
+    map.entry(uuid.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// 翻译整篇论文。返回 element_id → 译文 映射（含缓存命中部分）。
 #[tauri::command]
@@ -430,15 +470,22 @@ pub async fn translate_paper(
     model_id: String,
 ) -> Result<TranslateResult, String> {
     let uuid = pdf_uuid(&pdf_path);
+
+    let lang = if target_lang.is_empty() { "zh".to_string() } else { target_lang };
+    let model_id = if model_id.is_empty() { "deepseek-v4-flash".to_string() } else { model_id };
+    // 提前校验模型，避免持锁后才发现非法模型
+    let _ = super::model_by_id(&model_id).ok_or_else(|| format!("未知模型: {}", model_id))?;
+
+    // 同论文并发翻译互斥：第二个调用方等待第一个完成（完成后可命中缓存）
+    let lock = translate_lock_for(&uuid);
+    let _guard = lock.lock().await;
+
     let paper_dir = papers_dir(&app)?.join(&uuid);
     let parsed_path = paper_dir.join("parsed.json");
     let parsed_raw = std::fs::read_to_string(&parsed_path)
         .map_err(|_| "ERR:PARSE_NOT_FOUND:论文尚未解析，请先打开 PDF".to_string())?;
     let parsed: serde_json::Value =
         serde_json::from_str(&parsed_raw).map_err(|e| format!("读取解析结果失败: {}", e))?;
-
-    let lang = if target_lang.is_empty() { "zh".to_string() } else { target_lang };
-    let model_id = if model_id.is_empty() { "deepseek-v4-flash".to_string() } else { model_id };
 
     // 0. 加载已有缓存（未变则复用）
     let source_hash = simple_hash(&parsed_raw);
@@ -513,6 +560,9 @@ pub async fn translate_paper(
     let fixed_preamble = "请翻译下面给出的论文段落。每段译文必须与原文一一对应，不得合并、删减或重新排序；公式、编号、引用标记[1]等原样保留；只输出 JSON。";
     let mut total_prompt: u64 = 0;
     let mut total_hit: u64 = 0;
+    // 已翻译译文（按阅读顺序累积），用于后续批次的术语一致性上下文。
+    // 不直接取 cached.values()（HashMap 随机序），保证上下文顺序稳定、可控。
+    let mut ctx_buf: Vec<String> = Vec::new();
 
     for (idx, chunk) in chunks.iter().enumerate() {
         let mut content = String::new();
@@ -520,12 +570,20 @@ pub async fn translate_paper(
         for item in chunk.iter() {
             content.push_str(&format!("[element_id: {}]\n{}\n\n", item.element_id, item.text));
         }
-        // 术语一致性上下文：追加在内容末尾（不破坏前缀），供新批次沿用术语
-        if idx > 0 {
+        // 术语一致性上下文：追加在内容末尾（不破坏前缀），供新批次沿用术语。
+        // 从已翻译译文末尾取最近若干条（阅读顺序靠后 = 与本批相邻），并限制总 token 数，
+        // 避免累积后撑爆批次预算。
+        if idx > 0 && !ctx_buf.is_empty() {
             content.push_str("【术语上下文（已翻译的相邻段落，供参考术语译法，无需重复翻译）】\n");
-            let ctx: Vec<&String> = cached.values().take(8).collect();
-            for t in ctx {
-                content.push_str(&format!("{}\n", t));
+            let mut ctx_tokens = 0usize;
+            for t in ctx_buf.iter().rev().take(8) {
+                let t_tokens = estimate_tokens(t);
+                if ctx_tokens + t_tokens > 1500 {
+                    break;
+                }
+                content.push_str(t);
+                content.push('\n');
+                ctx_tokens += t_tokens;
             }
         }
 
@@ -534,7 +592,7 @@ pub async fn translate_paper(
             ("user".to_string(), fixed_preamble.to_string()),
             ("user".to_string(), content),
         ];
-        let (raw, usage) = call_model(&model_id, messages, Some(max_out as u32)).await?;
+        let (raw, usage) = call_model(&model_id, messages, Some(max_out as u32), None).await?;
         total_prompt += usage.prompt_tokens;
         total_hit += usage.cache_hit_tokens;
         let parsed_map = parse_translation_json(&raw);
@@ -546,7 +604,8 @@ pub async fn translate_paper(
         // 校验：模型可能漏翻部分段落，补上"原文"作为降级（保证不丢内容）
         for item in chunk.iter() {
             let v = parsed_map.get(&item.element_id).cloned().unwrap_or_else(|| item.text.clone());
-            cached.insert(item.element_id.clone(), v);
+            cached.insert(item.element_id.clone(), v.clone());
+            ctx_buf.push(v);
         }
         done += chunk.len();
         emit(&app, done, items.len(), format!("翻译中（{}/{}）", done, items.len()));
@@ -586,4 +645,80 @@ pub async fn translate_paper(
         prompt_tokens: total_prompt,
         cache_hit_tokens: total_hit,
     })
+}
+
+// ========== 单元测试 ==========
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimate_tokens() {
+        // 纯中文：4 字 × 1.5 = 6
+        assert_eq!(estimate_tokens("中文测试"), 6);
+        // 纯英文：11 字符 × 0.3 = 3.3 → 3（截断）
+        assert_eq!(estimate_tokens("hello world"), 3);
+        // 混合：2×1.5 + 6×0.3 = 4.8 → 4
+        assert_eq!(estimate_tokens("你好 world"), 4);
+    }
+
+    #[test]
+    fn test_parse_translation_json_formats() {
+        // A：paragraphs 数组（标准格式）
+        let a = r#"{"paragraphs": [{"element_id": "p1", "translated_text": "译文一"}, {"element_id": "p2", "translated_text": "译文二"}]}"#;
+        let m = parse_translation_json(a);
+        assert_eq!(m.get("p1").map(String::as_str), Some("译文一"));
+        assert_eq!(m.get("p2").map(String::as_str), Some("译文二"));
+
+        // B：直接键值映射
+        let b = r#"{"el_1": "你好", "el_2": "世界"}"#;
+        let m = parse_translation_json(b);
+        assert_eq!(m.get("el_1").map(String::as_str), Some("你好"));
+
+        // C：裸数组
+        let c = r#"[{"element_id": "x", "translated_text": "甲"}]"#;
+        let m = parse_translation_json(c);
+        assert_eq!(m.get("x").map(String::as_str), Some("甲"));
+
+        // D：截断 JSON（缺右括号）→ 自动补全
+        let d = r#"{"paragraphs": [{"element_id": "t", "translated_text": "截断"}"#;
+        let m = parse_translation_json(d);
+        assert_eq!(m.get("t").map(String::as_str), Some("截断"));
+
+        // 围栏包裹
+        let fence = "```json\n{\"paragraphs\": [{\"element_id\": \"f\", \"translated_text\": \"围栏\"}]}\n```";
+        let m = parse_translation_json(fence);
+        assert_eq!(m.get("f").map(String::as_str), Some("围栏"));
+    }
+
+    #[test]
+    fn test_parse_translation_json_kv_fallback() {
+        // E：整体损坏 → 扫描 "key": "value" 兜底
+        let broken = r#"开头 {"el_9": "九", "el_10": "十", 剩余垃圾"#;
+        let m = parse_translation_json(broken);
+        assert_eq!(m.get("el_9").map(String::as_str), Some("九"));
+        assert_eq!(m.get("el_10").map(String::as_str), Some("十"));
+    }
+
+    #[test]
+    fn test_parse_translation_json_numeric_ids() {
+        // 模型常把数字 id 输出成 123（无引号）
+        let raw = r#"{"paragraphs": [{"element_id": 123, "translated_text": "数字id"}]}"#;
+        let m = parse_translation_json(raw);
+        assert_eq!(m.get("123").map(String::as_str), Some("数字id"));
+    }
+
+    #[test]
+    fn test_parse_translation_json_empty() {
+        assert!(parse_translation_json("").is_empty());
+        assert!(parse_translation_json("```\n```").is_empty());
+        assert!(parse_translation_json("完全不是 JSON").is_empty());
+    }
+
+    #[test]
+    fn test_strip_code_fence() {
+        assert_eq!(strip_code_fence("```json\n{}\n```"), "{}");
+        assert_eq!(strip_code_fence("{}"), "{}");
+    }
 }

@@ -20,7 +20,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::env_manager::{app_data_dir, pick_python};
+use crate::env_manager::app_data_dir;
 
 // ========== 数据结构（与 parse_pdf.py 输出一致，camelCase） ==========
 
@@ -193,7 +193,10 @@ fn spawn_stdout_reader(
                     let _ = tx.send(ScriptLine::Progress(p));
                 }
                 Some(ScriptLine::Error(e)) => {
-                    let _ = error_buf2.lock().unwrap().insert(e.clone());
+                    // 锁毒化时跳过记录（不 panic；P3-1 防御）
+                    if let Ok(mut g) = error_buf2.lock() {
+                        let _ = g.insert(e.clone());
+                    }
                     let _ = tx.send(ScriptLine::Error(e));
                 }
                 Some(ScriptLine::Output(o)) => {
@@ -219,10 +222,12 @@ fn spawn_stderr_collector(stderr: std::process::ChildStderr) -> std::sync::Arc<s
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             let Ok(line) = line else { break };
-            let mut b = buf2.lock().unwrap();
-            if b.len() < 65536 {
-                b.push_str(&line);
-                b.push('\n');
+            // 锁毒化时丢弃本行（P3-1 防御，不 panic）
+            if let Ok(mut b) = buf2.lock() {
+                if b.len() < 65536 {
+                    b.push_str(&line);
+                    b.push('\n');
+                }
             }
         }
     });
@@ -258,7 +263,10 @@ static PARSE_LOCKS: std::sync::OnceLock<
 fn lock_for(uuid: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     let map = PARSE_LOCKS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut map = map.lock().unwrap();
+    // 锁毒化时兜底：退化为独立锁（P3-1 防御，不 panic）
+    let Ok(mut map) = map.lock() else {
+        return std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    };
     map.entry(uuid.to_string())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -270,10 +278,6 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
     // 0. 前置检查
     if !Path::new(&pdf_path).exists() {
         return Err("ENV:PDF_NOT_FOUND".into());
-    }
-    let env = crate::env_manager::check_environment(app.clone()).map_err(|e| e.to_string())?;
-    if !env.opendataloader.installed {
-        return Err("ENV:OPENDATALOADER_NOT_READY".into());
     }
 
     // 0.5 同 PDF 并发互斥：第二个调用方会等待第一个完成（解析结果会被缓存，
@@ -300,6 +304,7 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
     };
 
     // 2. 缓存：papers/{uuid}/parsed.json
+    //    命中直接返回，无需环境检测（读缓存不依赖解析引擎）。
     let out_json = paper_dir.join("parsed.json");
     if out_json.exists() {
         // 缓存反序列化失败时降级重新解析（Python/Rust 字段命名变化时会触发）。
@@ -325,6 +330,13 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
         }
     }
 
+    // 3. 环境检测（进程级 TTL 缓存；代码审查 P4：不再每次解析都探测子进程）
+    let env = crate::env_manager::check_environment_cached(&app, Duration::from_secs(30))
+        .map_err(|e| e.to_string())?;
+    if !env.opendataloader.installed {
+        return Err("ENV:OPENDATALOADER_NOT_READY".into());
+    }
+
     // 1.5 清理上次失败遗留的 ERROR_*.log，避免本次解析失败时误读旧内容。
     // ERROR_*.log 由 Python 端在 except 兜底写入；本次解析前清掉，保证只反映本次错误。
     if let Ok(entries) = fs::read_dir(&paper_dir) {
@@ -337,8 +349,8 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
         }
     }
 
-    // 2. Python
-    let Some(python) = pick_python(&app) else {
+    // 2. Python（进程级 TTL 缓存，避免每次解析探测）
+    let Some(python) = crate::env_manager::pick_python_cached(&app, Duration::from_secs(30)) else {
         return Err("ENV:PYTHON_NOT_READY".into());
     };
 
@@ -353,6 +365,15 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
         .arg(&work_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // P2-1：Windows 静默——禁止子进程弹出控制台窗口
+    //（CREATE_NO_WINDOW = 0x08000000；无此标志时 GUI 应用 spawn 的控制台
+    //  子进程可能新建黑色窗口闪现）
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
 
     // 5. 启动 + 进度/错误收集
     let mut child = cmd.spawn().map_err(|e| format!("启动解析失败: {}", e))?;
@@ -370,16 +391,27 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            // 非阻塞轮询：tokio::time::sleep 挂起当前任务而非阻塞线程
+            // （代码审查 P4：原 std::thread::sleep 会卡住 async runtime）
+            Ok(None) => tokio::time::sleep(Duration::from_millis(200)).await,
             Err(e) => return Err(format!("等待解析进程失败: {}", e)),
         }
     };
 
     // 7. 失败处理：优先使用 stdout ERROR 行的完整 traceback，stderr / ERROR.log 作补充
     if !status.success() {
-        let mut detail = stdout_error.lock().unwrap().take().unwrap_or_default();
+        // 锁毒化时退化为空（不 panic，P3-1 防御）
+        let mut detail = match stdout_error.lock() {
+            Ok(mut g) => g.take().unwrap_or_default(),
+            Err(_) => String::new(),
+        };
         if detail.is_empty() {
-            detail = stderr_buf.lock().unwrap().trim().to_string();
+            if let Ok(g) = stderr_buf.lock() {
+                let t = g.trim();
+                if !t.is_empty() {
+                    detail = t.to_string();
+                }
+            }
         }
         // 终极兜底：Python 写到 paper_dir/ERROR_*.log（绕开 pipe）。当上述 stdout / stderr
         // 都因 Tauri pipe broken 而丢失时，这个文件包含完整错误详情。Python 端用时间戳
@@ -435,6 +467,71 @@ pub async fn parse_pdf(app: AppHandle, pdf_path: String) -> Result<ParsedResult,
     }
 
     Ok(result)
+}
+
+/// 返回论文解析副本 papers/{uuid}/original.pdf 的绝对路径
+/// （供「原图视图」用 pdfjs 渲染；源 PDF 可能已被移动，副本始终存在）。
+#[tauri::command]
+pub fn get_paper_pdf_path(app: AppHandle, pdf_path: String) -> Result<String, String> {
+    let uuid = pdf_uuid(&pdf_path);
+    let p = papers_dir(&app)?.join(&uuid).join("original.pdf");
+    if p.exists() {
+        Ok(p.to_string_lossy().to_string())
+    } else {
+        Err("ERR:PARSE_NOT_FOUND:论文尚未解析".into())
+    }
+}
+
+/// 读取论文 AI 重排产物 papers/{uuid}/restructured.md（占位用，AI 重排功能开发中）。
+/// 不存在返回 Err("NOT_FOUND")，前端据此显示"开发中"提示。
+#[tauri::command]
+pub fn get_restructured_doc(app: AppHandle, pdf_path: String) -> Result<String, String> {
+    let uuid = pdf_uuid(&pdf_path);
+    let p = papers_dir(&app)?.join(&uuid).join("restructured.md");
+    if !p.exists() {
+        return Err("NOT_FOUND".into());
+    }
+    std::fs::read_to_string(&p).map_err(|e| format!("读取重排文档失败: {}", e))
+}
+
+/// 读取论文图片为 base64（AI 重排 [图N] 渲染用）。
+///
+/// 为什么不用 convertFileSrc/asset 协议：Windows 上 asset 协议对反斜杠 URL
+/// 的 scope 匹配不稳定（原图视图 PDF 403 同根因），改用 IPC 直传 base64
+/// 100% 可靠。路径校验限定在 papers 目录内（防任意文件读取）。
+#[tauri::command]
+pub fn read_image_base64(app: AppHandle, path: String) -> Result<String, String> {
+    // 路径必须在 papers 目录内
+    let papers = papers_dir(&app)?;
+    let canon = std::fs::canonicalize(&path).map_err(|e| format!("图片不存在: {}", e))?;
+    let papers_canon = papers
+        .canonicalize()
+        .map_err(|e| format!("无法定位论文目录: {}", e))?;
+    if !canon.starts_with(&papers_canon) {
+        return Err("非法路径：图片必须在论文目录内".into());
+    }
+    let data = std::fs::read(&canon).map_err(|e| format!("读取图片失败: {}", e))?;
+    if data.is_empty() {
+        return Err("图片内容为空".into());
+    }
+    if data.len() > 8 * 1024 * 1024 {
+        return Err("图片超过 8MB".into());
+    }
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    // 附带 MIME（按扩展名，简单处理）
+    let ext = canon
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    Ok(format!("data:{mime};base64,{b64}"))
 }
 
 /// 获取最新的解析错误日志文件路径（供前端“查看详细日志”按钮使用）

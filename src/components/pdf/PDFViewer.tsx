@@ -9,8 +9,8 @@
  * - 保留：文字选中浮动弹窗、右键菜单、高亮
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { looksLikeFormula } from "../../lib/textUtils";
+import { PaperImage } from "./PaperImage";
 import type {
   ContextMenuAction,
   ParsedElement,
@@ -29,11 +29,11 @@ function tableRows(text: string): string[][] {
     .filter((row) => row.some(Boolean));
 }
 
-/** 高亮颜色：命中 elementId 且无 range 时整块高亮 */
+/** 高亮颜色：命中 elementId 且无 range 时整块高亮（返回 CSS 变量，主题自适应） */
 function highlightColorFor(elId: string, highlights: PDFViewerProps["highlights"]): string | null {
   const h = highlights?.find((x) => x.elementId === elId && !x.range);
   if (!h) return null;
-  return HIGHLIGHT_COLORS.find((c) => c.id === h.colorId)?.hex ?? "#FFD700";
+  return HIGHLIGHT_COLORS.find((c) => c.id === h.colorId)?.cssVar ?? "var(--hl-insight)";
 }
 
 interface BlockProps {
@@ -47,8 +47,6 @@ interface BlockProps {
 
 /** 单个元素块：按类型渲染（标题/段落/图注/公式/图片/表格） */
 function ElementBlock({ el, displayText, highlight, onSelect, onContext }: BlockProps) {
-  // 图片加载失败标记（hooks 必须无条件调用）
-  const [imgFailed, setImgFailed] = useState(false);
   const common = {
     "data-pd-el": el.id,
     "data-pd-type": el.type,
@@ -56,35 +54,24 @@ function ElementBlock({ el, displayText, highlight, onSelect, onContext }: Block
     onContextMenu: (e: React.MouseEvent) => onContext(e, el),
   } as const;
 
-  const hlStyle = highlight ? { backgroundColor: `${highlight}55`, boxShadow: `inset 0 0 0 1.5px ${highlight}` } : undefined;
+  // 高亮基于 CSS 变量渲染（P2-2）：半透明底色用 color-mix（WebView2/Chromium 111+ 支持），
+  // 主题切换（--hl-* 变量变化）自动生效，无需 JS 感知主题
+  const hlStyle = highlight
+    ? {
+        backgroundColor: `color-mix(in srgb, ${highlight} 33%, transparent)`,
+        boxShadow: `inset 0 0 0 1.5px ${highlight}`,
+      }
+    : undefined;
 
-  // 图片：卡片化展示，保留原位置
+  // 图片：卡片化展示，保留原位置（base64 IPC 加载，绕开 asset 协议 403）
   if (el.type === "figure" && el.imageSrc) {
-    const imgUrl = convertFileSrc(el.imageSrc);
     return (
       <figure
         {...common}
         className="my-4 flex flex-col items-center gap-2 rounded-xl border border-border bg-bg-secondary/40 p-3 shadow-sm"
         style={hlStyle}
       >
-        {imgFailed ? (
-          <div className="py-6 text-center text-xs text-error">
-            图片加载失败
-            <div className="mt-1 break-all font-mono text-[10px] text-fg-tertiary">{el.imageSrc}</div>
-          </div>
-        ) : (
-          <img
-            src={imgUrl}
-            alt={displayText || "figure"}
-            className="max-h-[420px] max-w-full rounded object-contain"
-            draggable={false}
-            loading="lazy"
-            onError={() => {
-              console.error("[PDFViewer] 图片加载失败:", el.imageSrc, "→", imgUrl);
-              setImgFailed(true);
-            }}
-          />
-        )}
+        <PaperImage path={el.imageSrc} alt={displayText || "figure"} maxHeight={420} />
         {displayText && (
           <figcaption className="max-w-full px-1 text-center text-xs leading-relaxed text-fg-tertiary">
             {displayText}
@@ -204,9 +191,13 @@ function PageSection({
         <span className="text-[11px] font-medium tracking-widest text-fg-tertiary">第 {page.pageNumber} 页</span>
         <span className="h-px flex-1 bg-border/60" aria-hidden />
       </header>
-      {sorted.map((el) =>
-        // 空文本元素（解析兜底遗留）不渲染
-        el.text.trim() ? (
+      {sorted.map((el) => {
+        // 空文本元素（解析兜底遗留）不渲染，但图片元素允许无文本
+        const hasFigureImage = el.type === "figure" && el.imageSrc;
+        if (!el.text.trim() && !hasFigureImage) {
+          return null;
+        }
+        return (
           <ElementBlock
             key={el.id}
             el={el}
@@ -215,14 +206,14 @@ function PageSection({
             onSelect={onSelect}
             onContext={onContext}
           />
-        ) : null,
-      )}
+        );
+      })}
     </section>
   );
 }
 
 export function PDFViewer(props: PDFViewerProps) {
-  const { result, mode = "original", translations, highlights, onSelectText, onContextMenuAction } = props;
+  const { result, mode, translations, highlights, onSelectText, onContextMenuAction } = props;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; el: ParsedElement; text: string } | null>(null);
 
@@ -280,10 +271,10 @@ export function PDFViewer(props: PDFViewerProps) {
     };
   }, [menu]);
 
-  // bilingual：左右双栏（原文 / 译文）同步滚动
+  // 单栏渲染（双语由 Workspace 层拆分渲染两栏）
   const renderColumn = useCallback(
     (colMode: ViewMode) => (
-      <div className="h-full flex-1 overflow-y-auto overflow-x-hidden px-4 py-4" data-scroll-col>
+      <div className="h-full w-full overflow-y-auto overflow-x-hidden px-4 py-4" data-scroll-col>
         {result.pages.map((page) => (
           <PageSection
             key={page.pageNumber}
@@ -300,44 +291,9 @@ export function PDFViewer(props: PDFViewerProps) {
     [result.pages, translations, highlights, handleSelect, handleContext],
   );
 
-  const isBilingual = mode === "bilingual";
-  const leftMode: ViewMode = isBilingual ? "original" : mode;
-  const rightMode: ViewMode = isBilingual ? "translated" : mode;
-
-  // 对照模式同步滚动
-  useEffect(() => {
-    if (!isBilingual) return;
-    const cols = containerRef.current?.querySelectorAll<HTMLElement>("[data-scroll-col]");
-    if (!cols || cols.length < 2) return;
-    const [left, right] = cols;
-    let syncing = false;
-    const onScroll = (src: HTMLElement, dst: HTMLElement) => () => {
-      if (syncing) return;
-      syncing = true;
-      dst.scrollTop = src.scrollTop;
-      requestAnimationFrame(() => (syncing = false));
-    };
-    const lh = onScroll(left, right);
-    const rh = onScroll(right, left);
-    left.addEventListener("scroll", lh);
-    right.addEventListener("scroll", rh);
-    return () => {
-      left.removeEventListener("scroll", lh);
-      right.removeEventListener("scroll", rh);
-    };
-  }, [isBilingual, result.pages.length]);
-
   return (
     <div ref={containerRef} data-testid="pdf-viewer" className="relative flex h-full w-full overflow-hidden bg-bg-tertiary/40">
-      <div className="flex h-full w-full">
-        {renderColumn(leftMode)}
-        {isBilingual && (
-          <>
-            <div className="h-full w-px shrink-0 bg-border" aria-hidden />
-            {renderColumn(rightMode)}
-          </>
-        )}
-      </div>
+      <div className="flex h-full w-full">{renderColumn(mode)}</div>
 
       {/* 右键菜单 */}
       {menu && (

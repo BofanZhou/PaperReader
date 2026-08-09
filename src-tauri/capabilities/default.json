@@ -7,10 +7,6 @@
     "core:default",
     "opener:default",
     "dialog:default",
-    "dialog:allow-open",
-    "fs:default",
-    "store:default",
-    "http:default",
-    "sql:default"
+    "dialog:allow-open"
   ]
 }

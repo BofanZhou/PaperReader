@@ -37,7 +37,7 @@ const MAX_WIDTH = 380;
 export function SelectionPopup({
   selection,
   containerRect,
-  activeColor = "yellow",
+  activeColor = "insight",
   translation,
   translating = false,
   onTranslate,
@@ -116,7 +116,8 @@ export function SelectionPopup({
               title={`高亮（${c.label}）`}
               className="size-5 rounded-full border border-black/10 transition-transform hover:scale-110"
               style={{
-                backgroundColor: c.hex,
+                // P2-2：色块用设计系统 CSS 变量（--hl-*），主题自动适配
+                backgroundColor: c.cssVar,
                 outline: activeColor === c.id ? "2px solid var(--accent)" : "none",
                 outlineOffset: 1,
               }}
