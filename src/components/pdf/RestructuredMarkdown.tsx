@@ -17,6 +17,8 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { PaperImage } from "./PaperImage";
+import { ZoomBadge } from "./ZoomBadge";
+import { useViewZoom } from "../../hooks/useViewZoom";
 import type { ParsedResult } from "../../lib/env";
 import "katex/dist/katex.min.css";
 
@@ -150,6 +152,7 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
   const figures = useMemo(() => collectAssetSrcs(parsedResult ?? null, "figure"), [parsedResult]);
   const tables = useMemo(() => collectAssetSrcs(parsedResult ?? null, "table"), [parsedResult]);
   const tableTexts = useMemo(() => collectTableTexts(parsedResult ?? null), [parsedResult]);
+  const { zoom, handleReset, scrollRef } = useViewZoom<HTMLDivElement>({ min: 0.5, max: 3 });
 
   const segments = useMemo(() => {
     const wrapped = autoWrapLatex(markdown);
@@ -157,8 +160,8 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
   }, [markdown]);
 
   return (
-    <div className="h-full overflow-y-auto bg-bg-primary">
-      <div className="mx-auto max-w-3xl px-6 py-5">
+    <div ref={scrollRef} className="relative h-full overflow-y-auto bg-bg-primary">
+      <div className="mx-auto max-w-3xl px-6 py-5" style={{ zoom }}>
         <article className="prose-sm max-w-none text-sm leading-relaxed text-fg [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-medium [&_p]:my-2 [&_li]:my-0.5 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-bg-tertiary [&_pre]:p-3 [&_code]:text-xs">
           {segments.map((seg, i) => {
             if (seg.kind === "text") {
@@ -199,6 +202,7 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
           })}
         </article>
       </div>
+      <ZoomBadge zoom={zoom} onReset={handleReset} />
     </div>
   );
 }

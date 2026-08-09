@@ -11,11 +11,13 @@
  *
  * 依赖 pdfjs-dist（懒加载：仅进入本视图才下载 ~750KB 主库 + worker）。
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 // ?url 只引入 worker 文件 URL 常量（不打包 worker 代码进主包）
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "pdfjs-dist/web/pdf_viewer.css";
+import { ZoomBadge } from "./ZoomBadge";
+import { useViewZoom } from "../../hooks/useViewZoom";
 import type { ContextMenuAction, PDFViewerProps } from "../../types/pdf";
 
 interface PageSize {
@@ -51,17 +53,25 @@ export function PDFOriginalView({ pdfPath, onSelectText, onContextMenuAction }: 
   const loadingTaskRef = useRef<import("pdfjs-dist").PDFDocumentLoadingTask | null>(null);
   const [pdfDoc, setPdfDoc] = useState<import("pdfjs-dist").PDFDocumentProxy | null>(null);
   const [numPages, setNumPages] = useState(0);
-  const [pageSizes, setPageSizes] = useState<PageSize[]>([]);
+  /** 基准页尺寸（zoom=1 时，按 760px 基准宽计算） */
+  const [baseSizes, setBaseSizes] = useState<PageSize[]>([]);
   const [range, setRange] = useState<[number, number]>([0, 0]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null);
+  const { zoom, handleReset, scrollRef } = useViewZoom<HTMLDivElement>({ min: 0.5, max: 3 });
+
+  // 缩放后实际页尺寸 = 基准尺寸 × zoom（pdfjs 重渲染，保持清晰）
+  const pageSizes = useMemo(
+    () => baseSizes.map((s) => ({ w: Math.round(s.w * zoom), h: Math.round(s.h * zoom) })),
+    [baseSizes, zoom],
+  );
 
   // 加载 PDF + 计算各页 css 尺寸（按容器基准宽度等比缩放）
   useEffect(() => {
     let cancelled = false;
     setLoadError(null);
     setNumPages(0);
-    setPageSizes([]);
+    setBaseSizes([]);
     setPdfDoc(null);
 
     (async () => {
@@ -89,7 +99,7 @@ export function PDFOriginalView({ pdfPath, onSelectText, onContextMenuAction }: 
           p.cleanup();
         }
         if (cancelled) return;
-        setPageSizes(sizes);
+        setBaseSizes(sizes);
         setRange([0, Math.min(PAGE_OVERSCAN * 2 + 1, n)]);
       } catch (e) {
         if (!cancelled) setLoadError(String(e));
@@ -228,10 +238,17 @@ export function PDFOriginalView({ pdfPath, onSelectText, onContextMenuAction }: 
   }
 
   return (
-    <div ref={containerRef} className="h-full overflow-y-auto overflow-x-hidden bg-bg-tertiary/40">
+    <div
+      ref={(el) => {
+        containerRef.current = el;
+        scrollRef.current = el;
+      }}
+      className="relative h-full overflow-y-auto overflow-x-auto bg-bg-tertiary/40"
+    >
       <div className="mx-auto w-fit px-6 py-4" data-testid="pdf-original-view">
         {pages}
       </div>
+      <ZoomBadge zoom={zoom} onReset={handleReset} />
       {menu && (
         <div
           className="fixed z-50 min-w-40 overflow-hidden rounded-md border border-border bg-bg-secondary py-1 text-sm shadow-lg"

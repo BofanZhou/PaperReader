@@ -11,6 +11,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { looksLikeFormula } from "../../lib/textUtils";
 import { PaperImage } from "./PaperImage";
+import { ZoomBadge } from "./ZoomBadge";
+import { useViewZoom } from "../../hooks/useViewZoom";
 import type {
   ContextMenuAction,
   ParsedElement,
@@ -231,6 +233,7 @@ function PageSection({
 export function PDFViewer(props: PDFViewerProps) {
   const { result, mode, translations, highlights, onSelectText, onContextMenuAction } = props;
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const { zoom, handleReset, scrollRef } = useViewZoom<HTMLDivElement>({ min: 0.5, max: 3 });
   const [menu, setMenu] = useState<{ x: number; y: number; el: ParsedElement; text: string } | null>(null);
 
   // 文本选中 → 上报（弹窗由父级渲染）
@@ -290,26 +293,32 @@ export function PDFViewer(props: PDFViewerProps) {
   // 单栏渲染（双语由 Workspace 层拆分渲染两栏）
   const renderColumn = useCallback(
     (colMode: ViewMode) => (
-      <div className="h-full w-full overflow-y-auto overflow-x-hidden px-4 py-4" data-scroll-col>
-        {result.pages.map((page) => (
-          <PageSection
-            key={page.pageNumber}
-            page={page}
-            mode={colMode}
-            translations={translations}
-            highlights={highlights}
-            onSelect={handleSelect}
-            onContext={handleContext}
-          />
-        ))}
+      <div ref={scrollRef} className="h-full w-full overflow-y-auto overflow-x-auto px-4 py-4" data-scroll-col>
+        {/* zoom：WebView2/Chromium 原生缩放，文本矢量重排保持清晰 */}
+        <div className="w-full" style={{ zoom }}>
+          {result.pages.map((page) => (
+            <PageSection
+              key={page.pageNumber}
+              page={page}
+              mode={colMode}
+              translations={translations}
+              highlights={highlights}
+              onSelect={handleSelect}
+              onContext={handleContext}
+            />
+          ))}
+        </div>
       </div>
     ),
-    [result.pages, translations, highlights, handleSelect, handleContext],
+    [result.pages, translations, highlights, handleSelect, handleContext, zoom, scrollRef],
   );
 
   return (
     <div ref={containerRef} data-testid="pdf-viewer" className="relative flex h-full w-full overflow-hidden bg-bg-tertiary/40">
       <div className="flex h-full w-full">{renderColumn(mode)}</div>
+
+      {/* 缩放角标 + 重置按钮 */}
+      <ZoomBadge zoom={zoom} onReset={handleReset} />
 
       {/* 右键菜单 */}
       {menu && (
