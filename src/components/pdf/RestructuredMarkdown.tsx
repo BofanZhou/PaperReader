@@ -9,7 +9,7 @@
  *    对自定义协议图片的兼容问题（裂图）。
  * 2. 公式：先做兜底自动包裹（AI 未加 `$...$` 时也能渲染），再用
  *    remark-math + rehype-katex（output=html）渲染。
- * 3. 图片/表格找不到时显示占位，不裂图。
+ * 3. 图片/表格找不到时显示占位，有文本表格时降级为文本表格。
  */
 import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
@@ -27,7 +27,7 @@ interface Props {
 
 type AssetType = "figure" | "table";
 
-/** 按 readingOrder 收集 figure/table 的 imageSrc */
+/** 按 readingOrder 收集 figure/table 的 imageSrc（按全局阅读顺序） */
 function collectAssetSrcs(result: ParsedResult | null, kind: AssetType): string[] {
   if (!result) return [];
   const srcs: string[] = [];
@@ -40,6 +40,21 @@ function collectAssetSrcs(result: ParsedResult | null, kind: AssetType): string[
     }
   }
   return srcs;
+}
+
+/** 按 readingOrder 收集 table 元素的文本（用于截图缺失时降级为文本表格） */
+function collectTableTexts(result: ParsedResult | null): string[] {
+  if (!result) return [];
+  const texts: string[] = [];
+  for (const page of result.pages) {
+    const sorted = [...page.elements].sort((a, b) => a.readingOrder - b.readingOrder);
+    for (const el of sorted) {
+      if (el.type === "table" && el.text) {
+        texts.push(el.text);
+      }
+    }
+  }
+  return texts;
 }
 
 function FigureImage({ path, alt }: { path: string; alt: string }) {
@@ -60,11 +75,23 @@ function TableImage({ path, alt }: { path: string; alt: string }) {
   );
 }
 
-function MissingAsset({ alt }: { alt: string }) {
+function MissingAsset({ alt, hint }: { alt: string; hint?: string }) {
   return (
     <figure className="my-3 rounded-md border border-dashed border-border bg-bg-secondary/50 p-6 text-center text-xs text-fg-tertiary">
-      {alt}（未找到对应资源）
+      <div>{alt}（未找到对应资源）</div>
+      {hint && <div className="mt-1 text-fg-tertiary/80">{hint}</div>}
     </figure>
+  );
+}
+
+function TableTextFallback({ text, alt }: { text: string; alt: string }) {
+  return (
+    <div className="my-3">
+      <div className="mb-1 text-center text-xs text-fg-tertiary">{alt}（文本表格，截图未生成）</div>
+      <div className="overflow-x-auto rounded-md border border-border bg-bg-secondary/40 p-3">
+        <pre className="text-xs leading-relaxed text-fg-primary whitespace-pre-wrap">{text}</pre>
+      </div>
+    </div>
   );
 }
 
@@ -80,7 +107,6 @@ function splitByPlaceholders(md: string): Segment[] {
   const segs: Segment[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
-  // 重置 lastIndex（全局正则）
   PLACEHOLDER_RE.lastIndex = 0;
   while ((m = PLACEHOLDER_RE.exec(md)) !== null) {
     if (m.index > last) {
@@ -109,13 +135,10 @@ const HAS_MATH_DELIM = /\$[\s\S]*?\$/;
  * 只处理「整段都是 LaTeX」的情况，避免误包正文。
  */
 function autoWrapLatex(md: string): string {
-  // 按空行分段落
   return md.split(/\n{2,}/).map((para) => {
     const t = para.trim();
     if (!t) return para;
-    // 已有 $ 定界符 → 跳过
     if (HAS_MATH_DELIM.test(t)) return para;
-    // 段内含 LaTeX 命令且不含普通汉字/英文句子（行内数学常见特征：含 `\` 与 `{` 与 `^` 或 `_`）
     if (LATEX_CMD_RE.test(t) && /[\\{}]/.test(t)) {
       return `$$\n${t}\n$$`;
     }
@@ -126,6 +149,7 @@ function autoWrapLatex(md: string): string {
 export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
   const figures = useMemo(() => collectAssetSrcs(parsedResult ?? null, "figure"), [parsedResult]);
   const tables = useMemo(() => collectAssetSrcs(parsedResult ?? null, "table"), [parsedResult]);
+  const tableTexts = useMemo(() => collectTableTexts(parsedResult ?? null), [parsedResult]);
 
   const segments = useMemo(() => {
     const wrapped = autoWrapLatex(markdown);
@@ -152,11 +176,26 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
             if (seg.kind === "figure") {
               const imgSrc = figures[seg.index - 1];
               if (imgSrc) return <FigureImage key={`f-${i}`} path={imgSrc} alt={seg.alt} />;
-              return <MissingAsset key={`f-${i}`} alt={seg.alt} />;
+              return (
+                <MissingAsset
+                  key={`f-${i}`}
+                  alt={seg.alt}
+                  hint="可在解析时重新生成 PDF 截图，或确认该图已被解析。"
+                />
+              );
             }
+            // table
             const imgSrc = tables[seg.index - 1];
             if (imgSrc) return <TableImage key={`t-${i}`} path={imgSrc} alt={seg.alt} />;
-            return <MissingAsset key={`t-${i}`} alt={seg.alt} />;
+            const text = tableTexts[seg.index - 1];
+            if (text) return <TableTextFallback key={`tt-${i}`} text={text} alt={seg.alt} />;
+            return (
+              <MissingAsset
+                key={`t-${i}`}
+                alt={seg.alt}
+                hint="解析未识别到表格。建议重新解析，或在设置中开启混合（hybrid）模式。"
+              />
+            );
           })}
         </article>
       </div>
