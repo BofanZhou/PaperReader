@@ -81,8 +81,24 @@ function ElementBlock({ el, displayText, highlight, onSelect, onContext }: Block
     );
   }
 
-  // 表格：卡片化 + 表头行 + 斑马纹
+  // 表格：优先展示原图截图（还原度更高），无图时回退文本表格
   if (el.type === "table") {
+    if (el.imageSrc) {
+      return (
+        <figure
+          {...common}
+          className="my-4 flex flex-col items-center gap-2 rounded-xl border border-border bg-bg-secondary/40 p-3 shadow-sm"
+          style={hlStyle}
+        >
+          <PaperImage path={el.imageSrc} alt={displayText || "表格"} maxHeight={420} />
+          {displayText && (
+            <figcaption className="max-w-full px-1 text-center text-xs leading-relaxed text-fg-tertiary">
+              {displayText}
+            </figcaption>
+          )}
+        </figure>
+      );
+    }
     const rows = tableRows(displayText);
     return (
       <div {...common} className="my-4 overflow-x-auto rounded-xl border border-border bg-bg-secondary/40 shadow-sm" style={hlStyle}>

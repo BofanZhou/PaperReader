@@ -20,6 +20,7 @@ import { cn } from "../../lib/utils";
 import { PDFViewer } from "../pdf/PDFViewer";
 import { PDFOriginalView } from "../pdf/PDFOriginalView";
 import { RestructuredView } from "../pdf/RestructuredView";
+import { RestructuredMarkdown } from "../pdf/RestructuredMarkdown";
 import { SelectionPopup } from "../pdf/SelectionPopup";
 import type {
   ContextMenuAction,
@@ -66,6 +67,7 @@ export function Workspace({ onOpenFile }: Props) {
     translateState,
     translateProgress,
     translateError,
+    restructuredTranslation,
   } = useAppStore();
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT);
   const dragging = useRef(false);
@@ -114,6 +116,7 @@ export function Workspace({ onOpenFile }: Props) {
             translateState={translateState}
             translateProgress={translateProgress}
             translateError={translateError}
+            restructuredTranslation={restructuredTranslation}
           />
         ) : (
           <EmptyHome onOpenFile={onOpenFile} />
@@ -239,6 +242,7 @@ function ReaderView({
   translateState,
   translateProgress,
   translateError,
+  restructuredTranslation,
 }: {
   result: import("../../lib/env").ParsedResult;
   viewMode: "pdf-original" | "restructured" | "translated" | "bilingual";
@@ -246,6 +250,7 @@ function ReaderView({
   translateState: "idle" | "translating" | "error" | "success";
   translateProgress: import("../../lib/ai").TranslateProgress | null;
   translateError: string | null;
+  restructuredTranslation: string | null;
 }) {
   const areaRef = useRef<HTMLDivElement | null>(null);
   const [containerRect, setContainerRect] = useState<DOMRect | null>(null);
@@ -421,6 +426,19 @@ function ReaderView({
         )
       ) : viewMode === "restructured" ? (
         <RestructuredView pdfPath={useAppStore.getState().currentFile ?? ""} />
+      ) : viewMode === "translated" ? (
+        restructuredTranslation ? (
+          <RestructuredMarkdown markdown={restructuredTranslation} parsedResult={result} />
+        ) : (
+          <PDFViewer
+            result={result}
+            mode="translated"
+            translations={translations ?? undefined}
+            highlights={highlights}
+            onSelectText={handleSelectText}
+            onContextMenuAction={handleContextMenuAction}
+          />
+        )
       ) : viewMode === "bilingual" ? (
         <div className="flex h-full">
           {/* 左栏：原图 或 AI 重排（toggle） */}
@@ -460,16 +478,20 @@ function ReaderView({
               </button>
             </div>
           </div>
-          {/* 右栏：译文 */}
+          {/* 右栏：译文（优先展示 AI 重排文档的译文） */}
           <div className="flex-1">
-            <PDFViewer
-              result={result}
-              mode="translated"
-              translations={translations ?? undefined}
-              highlights={highlights}
-              onSelectText={handleSelectText}
-              onContextMenuAction={handleContextMenuAction}
-            />
+            {restructuredTranslation ? (
+              <RestructuredMarkdown markdown={restructuredTranslation} parsedResult={result} />
+            ) : (
+              <PDFViewer
+                result={result}
+                mode="translated"
+                translations={translations ?? undefined}
+                highlights={highlights}
+                onSelectText={handleSelectText}
+                onContextMenuAction={handleContextMenuAction}
+              />
+            )}
           </div>
         </div>
       ) : (

@@ -885,7 +885,7 @@ async fn install_opendataloader(app: &AppHandle) -> Result<(), String> {
         cmd.args([
             "-m", "pip", "install",
             "-i", PYPI_MIRROR,
-            "-U", "opendataloader-pdf[hybrid]",
+            "-U", "opendataloader-pdf[hybrid]", "PyMuPDF",
         ]);
         cmd.output()
     })
@@ -894,7 +894,7 @@ async fn install_opendataloader(app: &AppHandle) -> Result<(), String> {
     .map_err(|e| format!("pip 执行失败: {}", e))?;
     if !output.status.success() {
         return Err(format!(
-            "opendataloader-pdf[hybrid] 安装失败: {}",
+            "opendataloader-pdf[hybrid]/PyMuPDF 安装失败: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }

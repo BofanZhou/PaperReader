@@ -135,6 +135,22 @@ export const translatePaper = (
 export const onTranslateProgress = (cb: (p: TranslateProgress) => void): Promise<UnlistenFn> =>
   listen<TranslateProgress>("translate-progress", (event) => cb(event.payload));
 
+/** 翻译 AI 重排后的 Markdown 文档 */
+export interface RestructuredTranslationResult {
+  markdown: string;
+  modelId: string;
+  targetLang: string;
+  promptTokens: number;
+  estimatedCostUsd: number;
+}
+
+export const translateRestructuredDoc = (
+  pdfPath: string,
+  targetLang: string,
+  modelId: string,
+): Promise<RestructuredTranslationResult> =>
+  invoke<RestructuredTranslationResult>("translate_restructured_doc", { pdfPath, targetLang, modelId });
+
 // ========== AI 重排（Prompt 4 §9-14，Phase 1） ==========
 
 export interface RestructureProgress {

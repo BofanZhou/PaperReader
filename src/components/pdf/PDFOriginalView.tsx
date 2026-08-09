@@ -299,6 +299,11 @@ function PageCanvas({
         const textLayer = textLayerRef.current;
         if (!canvas || !textLayer) return;
 
+        // 清空文本层并强制与 canvas 同尺寸，避免 pdfjs TextLayer 坐标偏移或旧 span 残留
+        textLayer.innerHTML = "";
+        textLayer.style.width = `${cssWidth}px`;
+        textLayer.style.height = `${cssHeight}px`;
+
         // 取消上一次可能未完成的渲染（同一 canvas 不允许并发 render）
         renderTaskRef.current?.cancel();
         renderTaskRef.current = null;
@@ -390,6 +395,7 @@ function PageCanvas({
       <div
         ref={textLayerRef}
         className="textLayer"
+        style={{ width: cssWidth, height: cssHeight }}
         onMouseUp={onSelect}
         onContextMenu={(e) => {
           const sel = window.getSelection()?.toString().trim() ?? "";

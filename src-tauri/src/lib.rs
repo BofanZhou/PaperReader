@@ -36,6 +36,7 @@ pub fn run() {
             ai::test_connection,
             ai::chat_completion,
             ai::translate::translate_paper,
+            ai::translate::translate_restructured_doc,
             ai::restructure::ai_restructure,
             ocr::ocr_page_image,
         ])

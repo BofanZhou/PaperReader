@@ -647,6 +647,154 @@ pub async fn translate_paper(
     })
 }
 
+// ========== AI 重排文档翻译 ==========
+
+/// 重排文档翻译结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestructuredTranslationResult {
+    pub markdown: String,
+    pub model_id: String,
+    pub target_lang: String,
+    pub prompt_tokens: u64,
+    pub estimated_cost_usd: f64,
+}
+
+/// 按 token 预算切分 Markdown，优先在标题处切开，避免单段过长。
+fn split_markdown(md: &str, budget_tokens: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_tok = 0usize;
+    for line in md.lines() {
+        let trimmed = line.trim_start();
+        let is_heading = trimmed.starts_with('#');
+        let line_tok = estimate_tokens(line).max(5);
+        // 标题前如果当前块已经不小，先切分
+        if is_heading && !cur.is_empty() && cur_tok + line_tok > budget_tokens / 2 {
+            chunks.push(cur.trim().to_string());
+            cur.clear();
+            cur_tok = 0;
+        }
+        // 普通行超出预算也切分（避免单块过大）
+        if !cur.is_empty() && cur_tok + line_tok > budget_tokens {
+            chunks.push(cur.trim().to_string());
+            cur.clear();
+            cur_tok = 0;
+        }
+        cur.push_str(line);
+        cur.push('\n');
+        cur_tok += line_tok;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur.trim().to_string());
+    }
+    if chunks.is_empty() {
+        chunks.push(md.to_string());
+    }
+    chunks
+}
+
+/// 翻译 AI 重排后的 Markdown 文档。
+/// 输入 papers/{uuid}/restructured.md，输出 papers/{uuid}/restructured_translated_{model}_{lang}.md。
+/// 要求模型保持 Markdown 结构，不改动 [图N] 占位符。
+#[tauri::command]
+pub async fn translate_restructured_doc(
+    app: AppHandle,
+    pdf_path: String,
+    target_lang: String,
+    model_id: String,
+) -> Result<RestructuredTranslationResult, String> {
+    let uuid = pdf_uuid(&pdf_path);
+    let lang = if target_lang.is_empty() { "zh".to_string() } else { target_lang };
+    let model_id = if model_id.is_empty() { "deepseek-v4-flash".to_string() } else { model_id };
+    let _ = super::model_by_id(&model_id).ok_or_else(|| format!("未知模型: {}", model_id))?;
+
+    // 复用 translate_paper 的按论文互斥锁
+    let lock = translate_lock_for(&uuid);
+    let _guard = lock.lock().await;
+
+    let paper_dir = papers_dir(&app)?.join(&uuid);
+    let md_path = paper_dir.join("restructured.md");
+    if !md_path.exists() {
+        return Err("ERR:RESTRUCTURE_NOT_FOUND:请先进行 AI 重排".into());
+    }
+    let md_raw = std::fs::read_to_string(&md_path)
+        .map_err(|e| format!("读取重排文档失败: {}", e))?;
+    if md_raw.trim().is_empty() {
+        return Err("ERR:RESTRUCTURE_EMPTY:重排文档为空".into());
+    }
+
+    // 缓存：hash 校验源 Markdown 是否变化
+    let source_hash = simple_hash(&md_raw);
+    let cache_file = paper_dir.join(format!("restructured_translated_{}_{}.md", model_id, lang));
+    let hash_file = paper_dir.join(format!("restructured_translated_{}_{}.hash", model_id, lang));
+    if let (Ok(cached), Ok(h)) = (std::fs::read_to_string(&cache_file), std::fs::read_to_string(&hash_file)) {
+        if h.trim() == source_hash && !cached.trim().is_empty() {
+            return Ok(RestructuredTranslationResult {
+                markdown: cached,
+                model_id: model_id.clone(),
+                target_lang: lang.clone(),
+                prompt_tokens: 0,
+                estimated_cost_usd: 0.0,
+            });
+        }
+    }
+
+    let model = super::model_by_id(&model_id).ok_or_else(|| format!("未知模型: {}", model_id))?;
+    let sys_tokens = 500usize;
+    let available = (model.context_window as usize).saturating_sub(sys_tokens + 2000);
+    let max_out = model.max_output_tokens.max(2000) as usize;
+    let out_limited = ((max_out as f64) / 1.5 * 0.9) as usize;
+    let chunk_tokens = available.min(out_limited);
+    let chunks = split_markdown(&md_raw, chunk_tokens.max(2000));
+
+    let emit = |app: &AppHandle, done: usize, total: usize, msg: String| {
+        let _ = app.emit(TRANSLATE_PROGRESS_EVENT, &TranslateProgress { done, total, message: msg });
+    };
+
+    let system = format!(
+        "你是一位专业的学术论文翻译专家。把用户给出的 Markdown 论文段落翻译为{lang}。\
+         要求：1) 忠实原文，术语翻译专业准确；2) 保留学术语气；3) 保持 Markdown 结构（标题、列表、加粗、表格等）；\
+         4) **不改动 [图N] 占位符**，保持原样；5) 参考文献、作者单位、公式等保留原格式；\
+         6) 只输出翻译后的 Markdown，不要解释。",
+        lang = lang_label(&lang)
+    );
+    let fixed_preamble = "请翻译下面给出的 Markdown 论文段落。保持 Markdown 结构，[图N] 占位符不要翻译或改动，只输出 Markdown。";
+
+    let mut total_prompt: u64 = 0;
+    let mut translated_parts: Vec<String> = Vec::new();
+    let total = chunks.len();
+
+    for (idx, chunk) in chunks.iter().enumerate() {
+        emit(&app, idx, total, format!("翻译重排文档（{}/{}）", idx + 1, total));
+        let content = format!("【待翻译段落】\n\n{}\n", chunk);
+        let messages = vec![
+            ("system".to_string(), system.clone()),
+            ("user".to_string(), fixed_preamble.to_string()),
+            ("user".to_string(), content),
+        ];
+        let (raw, usage) = call_model(&model_id, messages, Some(max_out as u32), None).await?;
+        total_prompt += usage.prompt_tokens;
+        translated_parts.push(raw.trim().to_string());
+    }
+
+    let translated = translated_parts.join("\n\n");
+    let _ = std::fs::write(&cache_file, &translated);
+    let _ = std::fs::write(&hash_file, &source_hash);
+
+    let input_tokens = md_raw.len() as f64 * 0.5;
+    let cost = (input_tokens / 1e6 * model.price_input) + (input_tokens * 1.5 / 1e6 * model.price_output);
+    emit(&app, total, total, format!("重排文档翻译完成（{} tokens）", total_prompt));
+
+    Ok(RestructuredTranslationResult {
+        markdown: translated,
+        model_id,
+        target_lang: lang,
+        prompt_tokens: total_prompt,
+        estimated_cost_usd: cost,
+    })
+}
+
 // ========== 单元测试 ==========
 
 #[cfg(test)]

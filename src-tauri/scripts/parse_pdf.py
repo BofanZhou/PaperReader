@@ -635,6 +635,43 @@ def _detect_table_runs(elements: list[dict]) -> list[dict]:
     return merged
 
 
+def _render_table_images(result: dict, fitz_doc, work_dir: str) -> None:
+    """为所有 table 元素截取 PDF 原图区域，提升表格还原度。
+
+    截图保存在 work_dir/_images/table_p{page}_{id}.png，并把绝对路径写入
+    element["imageSrc"]。前端优先按图片展示表格，失败时回退文本表格。
+    """
+    img_dir = os.path.join(work_dir, "_images")
+    os.makedirs(img_dir, exist_ok=True)
+    for page in result.get("pages", []):
+        page_num = page.get("pageNumber", 1)
+        if page_num < 1 or page_num > len(fitz_doc):
+            continue
+        fitz_page = fitz_doc[page_num - 1]
+        page_h = fitz_page.rect.height
+        for el in page.get("elements", []):
+            if el.get("type") != "table" or el.get("imageSrc"):
+                continue
+            bbox = el.get("bbox", {})
+            left = bbox.get("left", 0.0)
+            bottom = bbox.get("bottom", 0.0)
+            right = bbox.get("right", 0.0)
+            top = bbox.get("top", 0.0)
+            if not (left < right and bottom < top):
+                continue
+            try:
+                # PDF 坐标 bottom-left 原点 → fitz 坐标 top-left 原点
+                rect = fitz.Rect(left, page_h - top, right, page_h - bottom)
+                pix = fitz_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect)
+                safe_id = str(el.get("id", ""))[:32] or "unknown"
+                out_path = os.path.join(img_dir, f"table_p{page_num}_{safe_id}.png")
+                pix.save(out_path)
+                el["imageSrc"] = os.path.abspath(out_path)
+            except Exception:
+                # 单张表格截图失败不影响整体解析
+                continue
+
+
 def _rebuild_empty_tables(elements: list[dict]) -> list[dict]:
     """修复 OpenDataLoader 表格空壳：
     1. 若能按 bbox 从同页散落段落重组出内容 → 填入表格；
@@ -890,6 +927,16 @@ def main() -> int:
         # 4. 转换为内部格式
         progress("converting", 85, "整理版面元素")
         result = convert(raw, page_sizes, work_dir)
+
+        # 4.5 表格原图截图（PyMuPDF）：优先像图片一样展示表格
+        try:
+            import fitz  # PyMuPDF
+
+            with fitz.open(pdf_path) as fitz_doc:
+                _render_table_images(result, fitz_doc, work_dir)
+            progress("converting", 90, "表格截图完成")
+        except Exception as e:
+            progress("converting", 90, f"表格截图不可用，回退文本表格：{e}")
 
         # 5. 写入 parsed.json
         out_path = os.path.join(output_dir, "parsed.json")

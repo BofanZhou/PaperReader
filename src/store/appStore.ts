@@ -3,9 +3,11 @@ import { onPdfProgress, parsePdf, type ParsedResult, type ParseProgress } from "
 import {
   aiRestructure,
   getAiConfig,
+  getRestructuredDoc,
   onRestructureProgress,
   onTranslateProgress,
   translatePaper,
+  translateRestructuredDoc,
   type ModelConfig,
   type RestructureProgress,
   type TranslateProgress,
@@ -43,10 +45,12 @@ interface AppState {
   // 翻译
   translateState: TranslateState;
   translateProgress: TranslateProgress | null;
-  /** element_id → 译文 */
+  /** element_id → 译文（基于 ODL 原始元素） */
   translations: Record<string, string> | null;
   translateError: string | null;
   estimatedCostUsd: number | null;
+  /** AI 重排文档的译文 Markdown */
+  restructuredTranslation: string | null;
 
   // AI 重排
   restructureState: "idle" | "running" | "error" | "success";
@@ -87,6 +91,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   translations: null,
   translateError: null,
   estimatedCostUsd: null,
+  restructuredTranslation: null,
 
   restructureState: "idle",
   restructureProgress: null,
@@ -115,6 +120,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       translations: null,
       translateError: null,
       estimatedCostUsd: null,
+      restructuredTranslation: null,
       restructureState: "idle",
       restructureProgress: null,
       restructuredDoc: null,
@@ -187,7 +193,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }),
 
   runTranslate: async () => {
-    const { currentFile, model } = get();
+    const { currentFile, model, restructuredDoc } = get();
     if (!currentFile) return;
     if (get().translateState === "translating") return;
 
@@ -204,8 +210,31 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     try {
+      // 优先翻译 AI 重排后的 Markdown（若存在）；否则回退到 ODL 元素级翻译
+      let restructuredMd = restructuredDoc;
+      if (!restructuredMd) {
+        try {
+          restructuredMd = await getRestructuredDoc(fileAtStart);
+          set({ restructuredDoc: restructuredMd });
+        } catch {
+          restructuredMd = null;
+        }
+      }
+
+      if (restructuredMd) {
+        const result = await translateRestructuredDoc(fileAtStart, "zh", model);
+        // 已切换论文 / 已发起新翻译 → 丢弃过期结果（P2 竞态修复）
+        if (reqId !== translateReqId || get().currentFile !== fileAtStart) return;
+        set({
+          translateState: "success",
+          restructuredTranslation: result.markdown,
+          estimatedCostUsd: result.estimatedCostUsd,
+          translateError: null,
+        });
+        return;
+      }
+
       const result: TranslateResult = await translatePaper(fileAtStart, "zh", model);
-      // 已切换论文 / 已发起新翻译 → 丢弃过期结果（P2 竞态修复）
       if (reqId !== translateReqId || get().currentFile !== fileAtStart) return;
       set({
         translateState: "success",
@@ -226,6 +255,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       translations: null,
       translateError: null,
       estimatedCostUsd: null,
+      restructuredTranslation: null,
     }),
 
   runRestructure: async (force = false) => {
