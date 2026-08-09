@@ -5,9 +5,10 @@
  * 被 RestructuredView、译文模式、对照模式共用。
  *
  * 设计要点：
- * 1. 不依赖 rehype-sanitize 放行自定义协议，直接把占位符转成 markdown image，
- *    再用自定义 img 组件映射回 parsed.json 中的 imageSrc。
- * 2. 公式使用 remark-math + rehype-katex（output=html）渲染。
+ * 1. 占位符通过**字符串切分**直接渲染为 React 组件，绕开 ReactMarkdown
+ *    对自定义协议图片的兼容问题（裂图）。
+ * 2. 公式：先做兜底自动包裹（AI 未加 `$...$` 时也能渲染），再用
+ *    remark-math + rehype-katex（output=html）渲染。
  * 3. 图片/表格找不到时显示占位，不裂图。
  */
 import { useMemo } from "react";
@@ -67,58 +68,96 @@ function MissingAsset({ alt }: { alt: string }) {
   );
 }
 
-const FIG_RE = /^fig:\/\/(\d+)$/;
-const TBL_RE = /^tbl:\/\/(\d+)$/;
+type Segment =
+  | { kind: "text"; content: string }
+  | { kind: "figure"; index: number; alt: string }
+  | { kind: "table"; index: number; alt: string };
+
+/** 匹配 `[图N]` / `[表N]`（前面不是 `!`，避免把已是 markdown 图片的占位符重复切分） */
+const PLACEHOLDER_RE = /(?<!!)\[(图|表)(\d+)\]/g;
+
+function splitByPlaceholders(md: string): Segment[] {
+  const segs: Segment[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  // 重置 lastIndex（全局正则）
+  PLACEHOLDER_RE.lastIndex = 0;
+  while ((m = PLACEHOLDER_RE.exec(md)) !== null) {
+    if (m.index > last) {
+      segs.push({ kind: "text", content: md.slice(last, m.index) });
+    }
+    const typeChar = m[1];
+    const num = parseInt(m[2], 10);
+    segs.push({
+      kind: typeChar === "图" ? "figure" : "table",
+      index: num,
+      alt: `${typeChar}${num}`,
+    });
+    last = m.index + m[0].length;
+  }
+  if (last < md.length) {
+    segs.push({ kind: "text", content: md.slice(last) });
+  }
+  return segs;
+}
+
+const LATEX_CMD_RE = /\\(?:frac|sqrt|sum|int|tag|left|right|cdot|partial|pi|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|tau|phi|omega|infty|pm|times|div|approx|le|ge|prod|cup|cap|notin|subset|supset|ln|log|sin|cos|tan|exp)\b/;
+const HAS_MATH_DELIM = /\$[\s\S]*?\$/;
+
+/**
+ * 兜底：AI 未用 `$...$` 包裹的 LaTeX 公式段落，自动用 `$$...$$` 包裹。
+ * 只处理「整段都是 LaTeX」的情况，避免误包正文。
+ */
+function autoWrapLatex(md: string): string {
+  // 按空行分段落
+  return md.split(/\n{2,}/).map((para) => {
+    const t = para.trim();
+    if (!t) return para;
+    // 已有 $ 定界符 → 跳过
+    if (HAS_MATH_DELIM.test(t)) return para;
+    // 段内含 LaTeX 命令且不含普通汉字/英文句子（行内数学常见特征：含 `\` 与 `{` 与 `^` 或 `_`）
+    if (LATEX_CMD_RE.test(t) && /[\\{}]/.test(t)) {
+      return `$$\n${t}\n$$`;
+    }
+    return para;
+  }).join("\n\n");
+}
 
 export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
   const figures = useMemo(() => collectAssetSrcs(parsedResult ?? null, "figure"), [parsedResult]);
   const tables = useMemo(() => collectAssetSrcs(parsedResult ?? null, "table"), [parsedResult]);
 
-  const prepared = useMemo(
-    () =>
-      markdown
-        // 负向回顾 (?<!!) 避免把已经是 markdown image 的占位符重复替换
-        .replace(/(?<!!)\[图(\d+)\]/g, "![图$1](fig://$1)")
-        .replace(/(?<!!)\[表(\d+)\]/g, "![表$1](tbl://$1)"),
-    [markdown],
-  );
+  const segments = useMemo(() => {
+    const wrapped = autoWrapLatex(markdown);
+    return splitByPlaceholders(wrapped);
+  }, [markdown]);
 
   return (
     <div className="h-full overflow-y-auto bg-bg-primary">
       <div className="mx-auto max-w-3xl px-6 py-5">
         <article className="prose-sm max-w-none text-sm leading-relaxed text-fg [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-medium [&_p]:my-2 [&_li]:my-0.5 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-bg-tertiary [&_pre]:p-3 [&_code]:text-xs">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[[rehypeKatex, { output: "html" }]]}
-            components={{
-              img: ({ src, alt }) => {
-                const fig = src ? FIG_RE.exec(src) : null;
-                if (fig) {
-                  const idx = parseInt(fig[1], 10) - 1;
-                  const imgSrc = figures[idx];
-                  if (imgSrc) return <FigureImage path={imgSrc} alt={alt ?? `图${fig[1]}`} />;
-                  return <MissingAsset alt={alt ?? `图${fig[1]}`} />;
-                }
-                const tbl = src ? TBL_RE.exec(src) : null;
-                if (tbl) {
-                  const idx = parseInt(tbl[1], 10) - 1;
-                  const imgSrc = tables[idx];
-                  if (imgSrc) return <TableImage path={imgSrc} alt={alt ?? `表${tbl[1]}`} />;
-                  return <MissingAsset alt={alt ?? `表${tbl[1]}`} />;
-                }
-                // 其它图片（网络/http 等）直接渲染
-                return (
-                  <img
-                    src={src}
-                    alt={alt ?? ""}
-                    className="mx-auto max-h-[420px] rounded-md border border-border"
-                  />
-                );
-              },
-            }}
-          >
-            {prepared}
-          </ReactMarkdown>
+          {segments.map((seg, i) => {
+            if (seg.kind === "text") {
+              if (!seg.content.trim()) return null;
+              return (
+                <ReactMarkdown
+                  key={`t-${i}`}
+                  remarkPlugins={[remarkGfm, remarkMath]}
+                  rehypePlugins={[[rehypeKatex, { output: "html" }]]}
+                >
+                  {seg.content}
+                </ReactMarkdown>
+              );
+            }
+            if (seg.kind === "figure") {
+              const imgSrc = figures[seg.index - 1];
+              if (imgSrc) return <FigureImage key={`f-${i}`} path={imgSrc} alt={seg.alt} />;
+              return <MissingAsset key={`f-${i}`} alt={seg.alt} />;
+            }
+            const imgSrc = tables[seg.index - 1];
+            if (imgSrc) return <TableImage key={`t-${i}`} path={imgSrc} alt={seg.alt} />;
+            return <MissingAsset key={`t-${i}`} alt={seg.alt} />;
+          })}
         </article>
       </div>
     </div>
