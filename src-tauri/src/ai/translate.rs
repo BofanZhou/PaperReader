@@ -755,11 +755,13 @@ pub async fn translate_restructured_doc(
     let system = format!(
         "你是一位专业的学术论文翻译专家。把用户给出的 Markdown 论文段落翻译为{lang}。\
          要求：1) 忠实原文，术语翻译专业准确；2) 保留学术语气；3) 保持 Markdown 结构（标题、列表、加粗、表格等）；\
-         4) **不改动 [图N] 占位符**，保持原样；5) 参考文献、作者单位、公式等保留原格式；\
-         6) 只输出翻译后的 Markdown，不要解释。",
+         4) **不改动 [图N]、[表N] 占位符**，保持原样；\
+         5) 公式中的 LaTeX 语法（$...$ / $$...$$）保持原样，只翻译公式周围的说明文字；\
+         6) 参考文献、作者单位等保留原格式；\
+         7) 只输出翻译后的 Markdown，不要解释。",
         lang = lang_label(&lang)
     );
-    let fixed_preamble = "请翻译下面给出的 Markdown 论文段落。保持 Markdown 结构，[图N] 占位符不要翻译或改动，只输出 Markdown。";
+    let fixed_preamble = "请翻译下面给出的 Markdown 论文段落。保持 Markdown 结构，[图N]、[表N] 占位符不要翻译或改动，LaTeX 公式只保留语法不翻译，只输出 Markdown。";
 
     let mut total_prompt: u64 = 0;
     let mut translated_parts: Vec<String> = Vec::new();

@@ -49,9 +49,12 @@ pub struct RestructureProgress {
 const SYSTEM_PROMPT: &str = "你是一位学术论文排版专家，只做结构重排，不做翻译。\
 将给定的杂乱文本序列重排为结构清晰的 Markdown。要求：\
 1) 合并被截断的断句/段落；2) 重建标题层级（#/##/###，最多三级）；3) 中英对照的摘要/关键词只保留一份；\
-4) 删除页眉页脚、版权、脚注等残留；5) 图表位置输出 [图N] 占位符（严格按图序清单编号，不得自造编号）；\
-6) 参考文献逐条整理；7) 逐段重排不得删减任何正文内容，禁止改写、摘要化或幻觉补全；\
-8) **绝对不要翻译成其他语言，按原文语言输出（输入是英文就输出英文，是中文就输出中文）**。只输出 Markdown，不要解释。";
+4) 删除页眉页脚、版权、脚注等残留；\
+5) 图片位置输出 [图N] 占位符，表格位置输出 [表N] 占位符（严格按给定清单编号，不得自造编号）；\
+6) 公式请使用标准 LaTeX 语法：行内公式用 $...$，独立公式用 $$...$$；\
+7) 参考文献逐条整理；\
+8) 逐段重排不得删减任何正文内容，禁止改写、摘要化或幻觉补全；\
+9) **绝对不要翻译成其他语言，按原文语言输出（输入是英文就输出英文，是中文就输出中文）**。只输出 Markdown，不要解释。";
 
 /// 抽取的重排输入元素（保留类型/页码/层级，供 prompt 组装）
 #[derive(Clone)]
@@ -78,25 +81,26 @@ fn lock_for(uuid: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// 从 parsed.json 提取元素序列（按页 + readingOrder 排序）+ 图序清单
-fn extract_items_and_figures(parsed: &serde_json::Value) -> (Vec<Item>, Vec<String>) {
+/// 从 parsed.json 提取元素序列（按页 + readingOrder 排序）+ 图序/表序清单
+fn extract_items_and_assets(parsed: &serde_json::Value) -> (Vec<Item>, Vec<String>, Vec<String>) {
     let mut items: Vec<Item> = Vec::new();
     let mut figures: Vec<String> = Vec::new();
+    let mut tables: Vec<String> = Vec::new();
 
     if let Some(pages) = parsed["pages"].as_array() {
         for page in pages {
             let page_num = page["pageNumber"].as_i64().unwrap_or(0);
             if let Some(elements) = page["elements"].as_array() {
-                // 按 readingOrder 排序，保证图序与前端 PDFViewer 一致
+                // 按 readingOrder 排序，保证图序/表序与前端 PDFViewer 一致
                 let mut sorted: Vec<&serde_json::Value> = elements.iter().collect();
                 sorted.sort_by_key(|el| el["readingOrder"].as_i64().unwrap_or(0));
                 for el in sorted {
                     let kind = el["type"].as_str().unwrap_or("paragraph").to_string();
                     let text = el["text"].as_str().unwrap_or("").trim().to_string();
-                    if text.is_empty() {
+                    if text.is_empty() && kind != "figure" && kind != "table" {
                         continue;
                     }
-                    // 图片：无文本，只登记图序（imageSrc 供前端映射）
+                    // 图片：登记图序（imageSrc 供前端映射）
                     if kind == "figure" {
                         if let Some(src) = el["imageSrc"].as_str() {
                             if !src.is_empty() {
@@ -104,6 +108,14 @@ fn extract_items_and_figures(parsed: &serde_json::Value) -> (Vec<Item>, Vec<Stri
                             }
                         }
                         continue;
+                    }
+                    // 表格：登记表序，同时保留文本供 AI 理解表格内容
+                    if kind == "table" {
+                        if let Some(src) = el["imageSrc"].as_str() {
+                            if !src.is_empty() {
+                                tables.push(src.to_string());
+                            }
+                        }
                     }
                     items.push(Item {
                         page: page_num,
@@ -115,7 +127,7 @@ fn extract_items_and_figures(parsed: &serde_json::Value) -> (Vec<Item>, Vec<Stri
             }
         }
     }
-    (items, figures)
+    (items, figures, tables)
 }
 
 /// token 估算（复用 translate 的固定系数：中文 1.5、英文 0.3/字符）
@@ -150,12 +162,15 @@ fn build_batches(items: Vec<Item>, input_budget: usize) -> Vec<Vec<Item>> {
     batches
 }
 
-/// 组装单批 user 内容（含图序清单，保证 [图N] 编号全局一致）
-fn build_batch_content(batch: &[Item], figure_list: &str) -> String {
+/// 组装单批 user 内容（含图序/表序清单，保证 [图N]/[表N] 编号全局一致）
+fn build_batch_content(batch: &[Item], figure_list: &str, table_list: &str) -> String {
     let mut content = String::new();
     content.push_str("【本论文共有图（请严格按此编号输出 [图N] 占位符）】\n");
     content.push_str(figure_list);
-    content.push_str("\n\n【待重排文本（按阅读顺序，格式：[类型|页码] 内容）】\n");
+    content.push_str("\n\n【本论文共有表（请严格按此编号输出 [表N] 占位符）】\n");
+    content.push_str(table_list);
+    content.push_str("\n\n【公式】行内公式请用 $...$，独立公式请用 $$...$$。\n");
+    content.push_str("\n【待重排文本（按阅读顺序，格式：[类型|页码] 内容）】\n");
     for it in batch {
         let tag = match it.kind.as_str() {
             "heading" => format!("标题{}", it.heading_level.map(|h| format!("(H{h})")).unwrap_or_default()),
@@ -211,18 +226,27 @@ pub async fn ai_restructure(
         .map_err(|_| "ERR:PARSE_NOT_FOUND:论文尚未解析，请先打开 PDF".to_string())?;
     let parsed: serde_json::Value = serde_json::from_str(&parsed_raw)
         .map_err(|e| format!("读取解析结果失败: {}", e))?;
-    let (items, figures) = extract_items_and_figures(&parsed);
+    let (items, figures, tables) = extract_items_and_assets(&parsed);
     if items.is_empty() {
         return Err("ERR:NO_CONTENT:论文没有可重排的文本内容".into());
     }
 
-    // 2. 图序清单
+    // 2. 图序/表序清单
     let figure_list = if figures.is_empty() {
         "（本文无图）".to_string()
     } else {
         let mut s = String::new();
         for (i, _) in figures.iter().enumerate() {
             s.push_str(&format!("[图{}]（第{}张） ", i + 1, i + 1));
+        }
+        s
+    };
+    let table_list = if tables.is_empty() {
+        "（本文无表）".to_string()
+    } else {
+        let mut s = String::new();
+        for (i, _) in tables.iter().enumerate() {
+            s.push_str(&format!("[表{}]（第{}个） ", i + 1, i + 1));
         }
         s
     };
@@ -233,7 +257,16 @@ pub async fn ai_restructure(
     let out_budget = (max_out as f64 / 1.5 * 0.85) as usize;
     let input_budget = (out_budget as f64 / 1.5 * 0.9) as usize;
     let batches = build_batches(items, input_budget.max(1500));
-    emit("prepare", 12, format!("共 {} 张图，分 {} 批重排", figures.len(), batches.len()));
+    emit(
+        "prepare",
+        12,
+        format!(
+            "共 {} 张图、{} 个表，分 {} 批重排",
+            figures.len(),
+            tables.len(),
+            batches.len()
+        ),
+    );
 
     // 4. 逐批调用（复用 call_model：SSE 关闭，直接返回全文）
     let mut md_parts: Vec<String> = Vec::new();
@@ -244,7 +277,7 @@ pub async fn ai_restructure(
             15 + ((idx as f64 / batches.len() as f64) * 70.0) as u8,
             format!("正在重排第 {}/{} 批（DeepSeek V4 Flash）", idx + 1, batches.len()),
         );
-        let content = build_batch_content(batch, &figure_list);
+        let content = build_batch_content(batch, &figure_list, &table_list);
         // 与 translate.rs call_model 一致的 tuple 消息格式
         let messages = vec![
             ("system".to_string(), SYSTEM_PROMPT.to_string()),

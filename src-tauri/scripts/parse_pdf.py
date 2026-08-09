@@ -519,6 +519,15 @@ def _table_has_content(text: str) -> bool:
 _TABLE_ROW_END = ".!?。！？"
 # 排除明显不是表格行的开头：年份起句、图注、编号标题、LaTeX 公式、OCR 数学符号
 _TABLE_ROW_EXCLUDE = re.compile(r"^\s*(\d{4}\s|fig\.?\s*\d|\d+(\.\d+)*\.\s|\$|\\[a-z]+|[ðþ¼√])")
+# 行内公式特征：等号 + 常见数学函数/希腊字母/符号（避免把公式行误判为表格行）
+_FORMULA_IN_ROW_RE = re.compile(
+    r"="
+    r".*"
+    r"(?:\\(?:ln|log|sin|cos|tan|exp|sqrt|sum|int|frac|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|tau|phi|omega)\b|"
+    r"(?:ln|log|sin|cos|tan|exp|sqrt)\(|"
+    r"[π∞±×÷≈≤≥∑∫α-ωΑ-Ω])",
+    re.IGNORECASE,
+)
 
 def _is_table_row_candidate(el: dict) -> bool:
     """疑似表格内容行：短、无句末标点、非标题/图注/公式/刻度。"""
@@ -550,19 +559,37 @@ def _is_table_row_candidate(el: dict) -> bool:
     # 含从属连词的长行（the/that/which 等）→ 正文句子（表格行是短语/值，不用连词）
     if len(t) > 40 and re.search(r"\b(the|that|which|with|their|because|however)\b", t):
         return False
+    # 等号行且带数学函数/希腊字母/符号 → 公式，不是表格
+    if _FORMULA_IN_ROW_RE.search(t):
+        return False
     return True
 
 
 def _make_table_from_rows(rows: list[dict], first: dict) -> dict:
-    """把连续表格行合并为一个 table 元素（text 每行一段，| 分列）。"""
+    """把连续表格行合并为一个 table 元素（text 每行一段，| 分列）。
+
+    bbox 取所有行 bbox 的并集，方便后续截取完整表格区域。
+    """
     lines = []
+    left = bottom = float("inf")
+    right = top = float("-inf")
     for r in rows:
         t = r["text"].strip()
         lines.append(t)
+        b = r["bbox"]
+        left = min(left, b["left"])
+        bottom = min(bottom, b["bottom"])
+        right = max(right, b["right"])
+        top = max(top, b["top"])
     return {
         "id": first["id"],
         "type": "table",
-        "bbox": first["bbox"],
+        "bbox": {
+            "left": left if left != float("inf") else first["bbox"]["left"],
+            "bottom": bottom if bottom != float("inf") else first["bbox"]["bottom"],
+            "right": right if right != float("-inf") else first["bbox"]["right"],
+            "top": top if top != float("-inf") else first["bbox"]["top"],
+        },
         "text": "\n".join(lines),
         "font": first.get("font"),
         "fontSize": first.get("fontSize"),
