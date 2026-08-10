@@ -8,6 +8,11 @@
     "opener:default",
     "dialog:default",
     "dialog:allow-open",
-    "sql:default"
+    "dialog:allow-save",
+    "sql:default",
+    "fs:default",
+    "fs:allow-read-text-file",
+    "fs:allow-write-text-file",
+    "fs:allow-write-file"
   ]
 }

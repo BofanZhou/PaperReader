@@ -1,12 +1,15 @@
 import {
   BookOpen,
+  FileDown,
   FolderOpen,
+  Loader2,
   Moon,
   Settings,
   Sun,
   Zap,
 } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../ui/button";
 import {
   Select,
@@ -23,6 +26,7 @@ import {
 import { cn } from "../../lib/utils";
 import { useAppStore, type ViewMode } from "../../store/appStore";
 import type { Theme } from "../../hooks/useTheme";
+import { exportTranslatedPdf } from "../../lib/exportPdf";
 import { SettingsDialog } from "../settings/SettingsDialog";
 
 const VIEW_MODES: { id: ViewMode; label: string }[] = [
@@ -41,7 +45,36 @@ interface Props {
 export function TopToolbar({ theme, onToggleTheme, onOpenFile }: Props) {
   const { viewMode, setViewMode, model, setModel, models, currentFile, runTranslate, translateState } = useAppStore();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportLabel, setExportLabel] = useState("");
   const translating = translateState === "translating";
+
+  // Prompt 9：导出翻译 PDF（需先解析 + 生成元素级译文）
+  const handleExport = useCallback(async () => {
+    const { parsedResult, translations } = useAppStore.getState();
+    if (!currentFile || !parsedResult || !translations || Object.keys(translations).length === 0) {
+      window.alert("请先解析论文并生成翻译（工具栏「翻译」按钮），再导出翻译 PDF。");
+      return;
+    }
+    setExporting(true);
+    setExportLabel("准备…");
+    try {
+      const originalPdfPath = await invoke<string>("get_paper_pdf_path", { pdfPath: currentFile });
+      const dest = await exportTranslatedPdf({
+        parsed: parsedResult,
+        translations,
+        originalPdfPath,
+        onProgress: (done, total) => setExportLabel(`${done}/${total}`),
+        onStatus: (m) => setExportLabel(m),
+      });
+      if (dest) window.alert(`翻译 PDF 已导出：\n${dest}`);
+    } catch (e) {
+      window.alert(`导出失败：${String(e)}`);
+    } finally {
+      setExporting(false);
+      setExportLabel("");
+    }
+  }, [currentFile]);
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-bg px-3">
@@ -104,6 +137,22 @@ export function TopToolbar({ theme, onToggleTheme, onOpenFile }: Props) {
         <Button size="sm" disabled={!currentFile || translating} onClick={() => runTranslate().catch(() => {})} aria-label="翻译当前论文">
           <Zap aria-hidden /> {translating ? "翻译中…" : "翻译"}
         </Button>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!currentFile || exporting}
+              onClick={() => void handleExport()}
+              aria-label="导出翻译 PDF"
+            >
+              {exporting ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : <FileDown aria-hidden />}
+              {exporting ? (exportLabel || "导出中…") : "导出"}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>导出翻译 PDF（保留图表/公式/页眉页脚，译文覆盖原文）</TooltipContent>
+        </Tooltip>
 
         <Tooltip>
           <TooltipTrigger asChild>

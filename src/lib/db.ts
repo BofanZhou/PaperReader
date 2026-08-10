@@ -285,3 +285,62 @@ export async function setSetting(key: string, value: string): Promise<void> {
     [key, value],
   );
 }
+
+// ========== Prompt 9 术语库 / 备份 ==========
+
+/** 读取全部设置（key → value），供备份导出 */
+export async function getAllSettings(): Promise<Record<string, string>> {
+  const db = await getDb();
+  await schemaReady;
+  const rows = await db.select<{ key: string; value: string }[]>(`SELECT key, value FROM settings`);
+  const out: Record<string, string> = {};
+  for (const r of rows) out[r.key] = r.value;
+  return out;
+}
+
+export interface TermRow {
+  term: string;
+  translation: string;
+  definition: string | null;
+  domain: string | null;
+}
+
+export async function countTerms(): Promise<number> {
+  const db = await getDb();
+  await schemaReady;
+  const rows = await db.select<{ n: number }[]>(`SELECT COUNT(*) AS n FROM terms`);
+  return rows[0]?.n ?? 0;
+}
+
+export async function listTerms(limit = 100): Promise<TermRow[]> {
+  const db = await getDb();
+  await schemaReady;
+  return db.select<TermRow[]>(
+    `SELECT term, translation, definition, domain FROM terms ORDER BY term LIMIT $1`,
+    [limit],
+  );
+}
+
+/** 批量导入术语（term 冲突忽略，返回实际新增行数） */
+export async function importTerms(
+  rows: { term: string; translation: string; definition?: string; domain?: string }[],
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const db = await getDb();
+  await schemaReady;
+  let inserted = 0;
+  for (const r of rows) {
+    try {
+      const res = await db.execute(
+        `INSERT INTO terms (term, translation, definition, domain)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT(term) DO NOTHING`,
+        [r.term.trim(), r.translation.trim(), r.definition ?? null, r.domain ?? null],
+      );
+      inserted += res.rowsAffected ?? 0;
+    } catch {
+      /* 单条失败跳过（脏数据不阻塞整批） */
+    }
+  }
+  return inserted;
+}

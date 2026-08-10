@@ -489,6 +489,80 @@ pub fn get_paper_uuid(pdf_path: String) -> String {
     pdf_uuid(&pdf_path)
 }
 
+/// 删除论文缓存目录 papers/{uuid}（Prompt 9 存储管理：单篇删除）。
+/// uuid 严格限定为 16 位 hex，防止路径穿越。
+#[tauri::command]
+pub fn delete_paper_dir(app: AppHandle, uuid: String) -> Result<(), String> {
+    if !uuid.chars().all(|c| c.is_ascii_hexdigit()) || uuid.len() != 16 {
+        return Err("ERR:INVALID_UUID:非法论文 id".into());
+    }
+    let dir = papers_dir(&app)?.join(&uuid);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| format!("删除论文缓存失败: {}", e))?;
+    }
+    Ok(())
+}
+
+/// 统计 papers 缓存目录总大小（字节，Prompt 9 存储管理：缓存大小显示）。
+#[tauri::command]
+pub fn papers_cache_size(app: AppHandle) -> Result<u64, String> {
+    let root = papers_dir(&app)?;
+    let mut total = 0u64;
+    fn walk(dir: &Path, total: &mut u64) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, total)?;
+            } else if let Ok(meta) = entry.metadata() {
+                *total += meta.len();
+            }
+        }
+        Ok(())
+    }
+    walk(&root, &mut total).map_err(|e| format!("统计缓存大小失败: {}", e))?;
+    Ok(total)
+}
+
+/// 读取系统 CJK 字体并返回 base64（Prompt 9 导出翻译 PDF：嵌入中文字体）。
+/// 候选顺序：simhei.ttf（黑体 TTF，兼容性最好）→ msyh.ttc → simsun.ttc →
+/// macOS PingFang → Linux Droid Sans Fallback / Noto Sans CJK。
+#[tauri::command]
+pub fn read_system_font() -> Result<String, String> {
+    use base64::Engine as _;
+    const CANDIDATES: &[&str] = &[
+        // Windows
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simsun.ttc",
+        // macOS
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        // Linux
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    ];
+    let mut last_err = "未找到可用的中文字体".to_string();
+    for c in CANDIDATES {
+        let p = Path::new(c);
+        if !p.exists() {
+            continue;
+        }
+        match fs::read(p) {
+            Ok(bytes) => {
+                if bytes.len() < 16 {
+                    continue;
+                }
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                return Ok(b64);
+            }
+            Err(e) => last_err = format!("读取 {} 失败: {}", c, e),
+        }
+    }
+    Err(format!("ERR:NO_CJK_FONT:{}", last_err))
+}
+
 /// 读取论文 AI 重排产物 papers/{uuid}/restructured.md。
 /// 不存在、或 parsed.json 已变化（restructured.hash 不匹配）时返回
 /// Err("NOT_FOUND")——前端据此触发重新重排（P1-2 缓存失效）。

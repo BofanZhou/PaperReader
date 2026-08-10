@@ -95,3 +95,15 @@ export const onPdfProgress = (cb: (p: ParseProgress) => void): Promise<UnlistenF
 
 /** 获取最新的解析错误日志文件路径 */
 export const getLastParseLog = (): Promise<string> => invoke<string>("get_last_parse_log");
+
+// ========== Prompt 9 存储管理 / 导出（Rust 命令封装） ==========
+
+/** 删除论文缓存目录 papers/{uuid}（单篇删除） */
+export const deletePaperDir = (uuid: string): Promise<void> =>
+  invoke<void>("delete_paper_dir", { uuid });
+
+/** 统计 papers 缓存目录总大小（字节） */
+export const papersCacheSize = (): Promise<number> => invoke<number>("papers_cache_size");
+
+/** 读取系统 CJK 字体（base64，导出翻译 PDF 嵌入用） */
+export const readSystemFont = (): Promise<string> => invoke<string>("read_system_font");

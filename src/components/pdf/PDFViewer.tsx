@@ -164,7 +164,11 @@ function ElementBlock({ el, displayText, highlight, onSelect, onContext }: Block
     );
   }
   return (
-    <p {...common} className="my-2 text-[15px] leading-[1.75] text-fg" style={hlStyle}>
+    <p
+      {...common}
+      className="my-2 text-[15px] leading-[1.75] text-fg"
+      style={{ ...hlStyle, fontSize: "var(--reader-font-size, 15px)", lineHeight: "var(--reader-line-height, 1.75)" }}
+    >
       {displayText}
     </p>
   );

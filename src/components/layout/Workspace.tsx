@@ -16,6 +16,7 @@ import { Progress } from "../ui/progress";
 import { Sidebar } from "./Sidebar";
 import { useAppStore } from "../../store/appStore";
 import { useChatStore } from "../../store/chatStore";
+import { useSettingsStore } from "../../store/settingsStore";
 import { getLastParseLog } from "../../lib/env";
 import { chatCompletion } from "../../lib/ai";
 import { cn } from "../../lib/utils";
@@ -267,6 +268,8 @@ function ReaderView({
   const [leftSource, setLeftSource] = useState<"pdf-original" | "restructured">("pdf-original");
   // 对照模式同步滚动开关（仅 AI 重排 / 译文左右对照等文本列对照生效；原图列不支持）
   const [syncScroll, setSyncScroll] = useState(false);
+  // 对照模式左栏宽度比例（设置面板「显示」可调）
+  const splitRatio = useSettingsStore((s) => s.splitRatio);
 
   // 原图视图下获取 papers/{uuid}/original.pdf（源文件可能已移动，副本始终存在）
   useEffect(() => {
@@ -500,8 +503,12 @@ function ReaderView({
         )
       ) : viewMode === "bilingual" ? (
         <div className="flex h-full">
-          {/* 左栏：原图 或 AI 重排（toggle） */}
-          <div ref={leftPaneRef} className="relative flex-1 border-r border-border">
+          {/* 左栏：原图 或 AI 重排（toggle）；宽度按设置的分栏比例 */}
+          <div
+            ref={leftPaneRef}
+            className="relative min-w-0 border-r border-border"
+            style={{ flex: `0 0 ${splitRatio * 100}%` }}
+          >
             {leftSource === "pdf-original" ? (
               originalPdfPath ? (
                 <PDFOriginalView

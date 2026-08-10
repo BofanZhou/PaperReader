@@ -200,7 +200,10 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
   return (
     <div ref={scrollRef} className="relative h-full overflow-y-auto bg-bg-primary" data-scroll-container>
       <div className="mx-auto max-w-3xl px-6 py-5" style={{ zoom }}>
-        <article className="prose-sm max-w-none text-sm leading-relaxed text-fg [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-medium [&_p]:my-2 [&_li]:my-0.5 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-bg-tertiary [&_pre]:p-3 [&_code]:text-xs">
+        <article
+          className="prose-sm max-w-none text-sm leading-relaxed text-fg [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-medium [&_p]:my-2 [&_li]:my-0.5 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-bg-tertiary [&_pre]:p-3 [&_code]:text-xs"
+          style={{ fontSize: "var(--reader-font-size, 14px)", lineHeight: "var(--reader-line-height, 1.6)" }}
+        >
           {segments.map((seg, i) => {
             if (seg.kind === "text") {
               if (!seg.content.trim()) return null;

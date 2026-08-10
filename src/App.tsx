@@ -14,6 +14,7 @@ import {
   setCachedEnvironmentReport,
 } from "./lib/envCache";
 import { useAppStore } from "./store/appStore";
+import { useSettingsStore } from "./store/settingsStore";
 import { initDb } from "./lib/db";
 
 type Phase = "checking" | "env-setup" | "ready";
@@ -34,11 +35,27 @@ function App() {
   const { theme, toggleTheme } = useTheme();
   const { setCurrentFile, loadModels } = useAppStore();
   const [phase, setPhase] = useState<Phase>("checking");
+  // Prompt 9 显示设置：字体大小/行距通过 CSS 变量全局生效
+  const fontSize = useSettingsStore((s) => s.fontSize);
+  const lineHeight = useSettingsStore((s) => s.lineHeight);
+  const loadSettings = useSettingsStore((s) => s.load);
 
   // 启动即加载模型列表（P6 单源化：模型配置来自 Rust default_models()）
   useEffect(() => {
     void loadModels();
   }, [loadModels]);
+
+  // Prompt 9：启动加载 SQLite settings（主题/字号/行距/翻译偏好）
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
+
+  // 显示设置 → CSS 变量（阅读视图段落/正文引用）
+  useEffect(() => {
+    const root = document.documentElement;
+    root.style.setProperty("--reader-font-size", `${fontSize}px`);
+    root.style.setProperty("--reader-line-height", String(lineHeight));
+  }, [fontSize, lineHeight]);
 
   // SQLite 落库初始化（Prompt 9/10 前置）：失败不阻塞 UI，文件缓存仍是主通道
   useEffect(() => {
