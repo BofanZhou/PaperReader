@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { onPdfProgress, parsePdf, type ParsedResult, type ParseProgress } from "../lib/env";
+import { upsertParsedPaper } from "../lib/db";
 import {
   aiRestructure,
   getAiConfig,
@@ -179,6 +180,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 已切换论文 → 丢弃过期结果
       if (reqId !== parseReqId || get().currentFile !== fileAtStart) return;
       set({ parseState: "success", parsedResult: result, parseError: null });
+      // SQLite 落库（Prompt 9/10 前置）：失败仅告警，不影响阅读
+      void upsertParsedPaper(result, fileAtStart);
     } catch (e) {
       if (reqId !== parseReqId || get().currentFile !== fileAtStart) return;
       set({ parseState: "error", parseError: String(e) });

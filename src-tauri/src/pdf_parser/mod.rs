@@ -482,6 +482,13 @@ pub fn get_paper_pdf_path(app: AppHandle, pdf_path: String) -> Result<String, St
     }
 }
 
+/// 返回论文的稳定 uuid（与 pdf_uuid 一致）。
+/// 前端用它作为 SQLite papers 表主键，将解析结果落库（Prompt 9/10 数据库前置）。
+#[tauri::command]
+pub fn get_paper_uuid(pdf_path: String) -> String {
+    pdf_uuid(&pdf_path)
+}
+
 /// 读取论文 AI 重排产物 papers/{uuid}/restructured.md。
 /// 不存在、或 parsed.json 已变化（restructured.hash 不匹配）时返回
 /// Err("NOT_FOUND")——前端据此触发重新重排（P1-2 缓存失效）。

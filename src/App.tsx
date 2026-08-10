@@ -14,6 +14,7 @@ import {
   setCachedEnvironmentReport,
 } from "./lib/envCache";
 import { useAppStore } from "./store/appStore";
+import { initDb } from "./lib/db";
 
 type Phase = "checking" | "env-setup" | "ready";
 
@@ -38,6 +39,11 @@ function App() {
   useEffect(() => {
     void loadModels();
   }, [loadModels]);
+
+  // SQLite 落库初始化（Prompt 9/10 前置）：失败不阻塞 UI，文件缓存仍是主通道
+  useEffect(() => {
+    initDb().catch((e) => console.error("[app] SQLite 初始化失败:", e));
+  }, []);
 
   // 首次启动：检测环境（优先使用缓存）
   useEffect(() => {

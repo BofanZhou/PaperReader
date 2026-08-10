@@ -27,6 +27,7 @@ pub fn run() {
             pdf_parser::parse_pdf,
             pdf_parser::get_last_parse_log,
             pdf_parser::get_paper_pdf_path,
+            pdf_parser::get_paper_uuid,
             pdf_parser::get_restructured_doc,
             pdf_parser::read_image_base64,
             pdf_parser::read_pdf_base64,
