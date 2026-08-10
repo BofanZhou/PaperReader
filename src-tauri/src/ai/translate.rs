@@ -425,7 +425,8 @@ struct TranslationCache {
 
 /// 缓存失效用 hash：SHA-256 前 32 位十六进制。
 /// 不用 DefaultHasher——其算法不保证跨 Rust 版本稳定，换编译器后旧缓存全部失效。
-fn simple_hash(s: &str) -> String {
+/// pub(crate)：AI 重排（restructure.rs）复用同一 hash 算法做 restructured.md 失效检测。
+pub(crate) fn simple_hash(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
@@ -436,6 +437,21 @@ fn simple_hash(s: &str) -> String {
 
 fn cache_path(app: &AppHandle, uuid: &str, model_id: &str, lang: &str) -> Result<std::path::PathBuf, String> {
     Ok(papers_dir(app)?.join(uuid).join(format!("translations_{}_{}.json", model_id, lang)))
+}
+
+/// 原子写文件（P2-8）：先写 .tmp 再 rename，避免写入中断时缓存文件损坏
+/// （损坏的缓存会被解析失败→重新翻译兜底，但原子写直接从根上消除该场景）。
+/// rename 在同一目录内是原子的（Windows NTFS 亦如此）。失败时清理残留 tmp。
+fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 // ========== 对外命令 ==========
@@ -610,9 +626,9 @@ pub async fn translate_paper(
         done += chunk.len();
         emit(&app, done, items.len(), format!("翻译中（{}/{}）", done, items.len()));
 
-        // 每批完成后落盘（中断后可续传）
+        // 每批完成后落盘（中断后可续传；P2-8 原子写）
         let cache = TranslationCache { source_hash: source_hash.clone(), translations: cached.clone() };
-        let _ = std::fs::write(&cache_file, serde_json::to_string(&cache).unwrap_or_default());
+        let _ = atomic_write(&cache_file, &serde_json::to_string(&cache).unwrap_or_default());
     }
 
     // 5. 估算成本（输出按输入的 1.5 倍）
@@ -620,9 +636,9 @@ pub async fn translate_paper(
     let output_tokens = input_tokens * 1.5;
     let cost = (input_tokens / 1e6 * model.price_input) + (output_tokens / 1e6 * model.price_output);
 
-    // 6. 最终落盘
+    // 6. 最终落盘（P2-8 原子写）
     let cache = TranslationCache { source_hash, translations: cached.clone() };
-    let _ = std::fs::write(&cache_file, serde_json::to_string(&cache).unwrap_or_default());
+    let _ = atomic_write(&cache_file, &serde_json::to_string(&cache).unwrap_or_default());
     let hit_pct = if total_prompt > 0 {
         total_hit as f64 * 100.0 / total_prompt as f64
     } else {
@@ -776,12 +792,24 @@ pub async fn translate_restructured_doc(
             ("user".to_string(), content),
         ];
         let (raw, usage) = call_model(&model_id, messages, Some(max_out as u32), None).await?;
+        // P2-3：截断检测——finish_reason="length" 说明输出被 max_tokens 硬截断，
+        // 此时译文不完整且会破坏 Markdown 结构，不落缓存、直接报错让用户重试
+        // （与 AI 重排的 RESTRUCTURE_TRUNCATED 处理一致）。
+        if usage.finish_reason == "length" {
+            return Err(format!(
+                "ERR:TRANSLATE_TRUNCATED:第 {}/{} 批译文输出被截断（finish_reason=length），\
+                 建议换输出上限更高的模型或重试",
+                idx + 1,
+                total
+            ));
+        }
         total_prompt += usage.prompt_tokens;
         translated_parts.push(raw.trim().to_string());
     }
 
     let translated = translated_parts.join("\n\n");
-    let _ = std::fs::write(&cache_file, &translated);
+    // P2-8 原子写：译文内容先 tmp 后 rename；hash 文件在内容落盘后写
+    let _ = atomic_write(&cache_file, &translated);
     let _ = std::fs::write(&hash_file, &source_hash);
 
     let input_tokens = md_raw.len() as f64 * 0.5;

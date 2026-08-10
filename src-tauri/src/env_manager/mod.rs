@@ -116,6 +116,13 @@ impl CmdLine {
     pub(crate) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.prefix_args);
+        // P2-2：所有环境检测/安装子进程统一 Windows 静默（不弹黑色控制台窗口），
+        // 与 parse_pdf / ocr 的子进程处理一致。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
         cmd
     }
 

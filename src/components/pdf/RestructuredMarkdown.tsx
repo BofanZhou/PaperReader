@@ -16,11 +16,33 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+// P0-1：AI 生成的 Markdown 渲染前必须过白名单（rehype-sanitize），
+// 否则 react-markdown 默认渲染原始 HTML（<script>/<img onerror>/javascript: 链接
+// 等）→ XSS。schema 需扩展以兼容 rehype-katex 输出的 span/class 与 MathML。
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { PaperImage } from "./PaperImage";
 import { ZoomBadge } from "./ZoomBadge";
 import { useViewZoom } from "../../hooks/useViewZoom";
 import type { ParsedResult } from "../../lib/env";
 import "katex/dist/katex.min.css";
+
+// ========== XSS 白名单 schema（P0-1） ==========
+// 基于 rehype-sanitize 默认 schema，只额外放行 AI 重排必需的元素/属性：
+// - span：保留 className（katex 类名）+ style（katex 输出用内联 style 精确定位
+//   公式——height/vertical-align/top 等，缺失会导致分数/根号/上下标渲染错乱；
+//   实测 output:"html" 模式 24 个 style 全需保留）
+// - code：保留 className（代码高亮类名）
+// 其余（script/iframe/onerror 等事件属性、javascript: URL、object/embed）保持
+// 默认拒绝——实测 XSS 主向量（script/onerror/javascript:href）全部仍被拦截。
+// 注：rehype-katex output:"html" 模式不输出 MathML（math/annotation 扩展冗余但无害）。
+const KATEX_SCHEMA = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    span: [...(defaultSchema.attributes?.span ?? []), ["className"], ["style"]],
+    code: [...(defaultSchema.attributes?.code ?? []), ["className"]],
+  },
+};
 
 interface Props {
   markdown: string;
@@ -160,7 +182,7 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
   }, [markdown]);
 
   return (
-    <div ref={scrollRef} className="relative h-full overflow-y-auto bg-bg-primary">
+    <div ref={scrollRef} className="relative h-full overflow-y-auto bg-bg-primary" data-scroll-container>
       <div className="mx-auto max-w-3xl px-6 py-5" style={{ zoom }}>
         <article className="prose-sm max-w-none text-sm leading-relaxed text-fg [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-medium [&_p]:my-2 [&_li]:my-0.5 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-bg-tertiary [&_pre]:p-3 [&_code]:text-xs">
           {segments.map((seg, i) => {
@@ -170,7 +192,12 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
                 <ReactMarkdown
                   key={`t-${i}`}
                   remarkPlugins={[remarkGfm, remarkMath]}
-                  rehypePlugins={[[rehypeKatex, { output: "html" }]]}
+                  rehypePlugins={[
+                    [rehypeKatex, { output: "html" }],
+                    // P0-1：白名单过滤必须在 katex 之后（katex 输出需要放行的元素
+                    // 由 KATEX_SCHEMA 扩展提供），拦截 AI 输出的恶意 HTML。
+                    [rehypeSanitize, KATEX_SCHEMA],
+                  ]}
                 >
                   {seg.content}
                 </ReactMarkdown>

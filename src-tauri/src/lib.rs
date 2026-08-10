@@ -29,6 +29,7 @@ pub fn run() {
             pdf_parser::get_paper_pdf_path,
             pdf_parser::get_restructured_doc,
             pdf_parser::read_image_base64,
+            pdf_parser::read_pdf_base64,
             ai::get_ai_config,
             ai::save_ai_config,
             ai::save_api_key,

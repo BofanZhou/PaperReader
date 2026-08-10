@@ -73,30 +73,40 @@ export const chatCompletion = (
     stream: false,
   });
 
-/** 流式 chat 补全：订阅 ai-chunk 事件逐段收到文本增量 */
+/** 流式 chat 补全：订阅 ai-chunk 事件逐段收到文本增量；done 在流结束后 resolve */
 export const streamChat = async (
   prompt: string,
   onChunk: (delta: string) => void,
   opts?: { system?: string; modelId?: string },
-): Promise<{ cancel: () => void }> => {
+): Promise<{ cancel: () => void; done: Promise<void> }> => {
   // cancel 后不再向回调投递任何增量/错误（原实现仅 unlisten，迟到的 chunk 仍会回调）
   let cancelled = false;
+  let unlistenCalled = false;
   const emit = (delta: string) => {
     if (!cancelled) onChunk(delta);
   };
   const unlisten = await listen<string>("ai-chunk", (e) => emit(e.payload));
-  // 触发流式请求（不 await 完成，事件驱动）
-  invoke<ChatResult>("chat_completion", {
+  const cleanup = () => {
+    if (!unlistenCalled) {
+      unlistenCalled = true;
+      unlisten();
+    }
+  };
+  // invoke 的 Promise 在 Rust 端整段流式完成后 resolve（等价于「流结束」信号）
+  const done = invoke<ChatResult>("chat_completion", {
     prompt,
     system: opts?.system ?? null,
     modelId: opts?.modelId ?? "deepseek-v4-flash",
     stream: true,
-  }).catch((e) => emit(`\n[错误] ${e}`));
+  })
+    .catch((e) => emit(`\n[错误] ${e}`))
+    .then(cleanup);
   return {
     cancel: () => {
       cancelled = true;
-      unlisten();
+      cleanup();
     },
+    done,
   };
 };
 

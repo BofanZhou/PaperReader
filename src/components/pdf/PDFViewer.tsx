@@ -293,7 +293,7 @@ export function PDFViewer(props: PDFViewerProps) {
   // 单栏渲染（双语由 Workspace 层拆分渲染两栏）
   const renderColumn = useCallback(
     (colMode: ViewMode) => (
-      <div ref={scrollRef} className="h-full w-full overflow-y-auto overflow-x-auto px-4 py-4" data-scroll-col>
+      <div ref={scrollRef} className="h-full w-full overflow-y-auto overflow-x-auto px-4 py-4" data-scroll-col data-scroll-container>
         {/* zoom：WebView2/Chromium 原生缩放，文本矢量重排保持清晰 */}
         <div className="w-full" style={{ zoom }}>
           {result.pages.map((page) => (

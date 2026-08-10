@@ -1,5 +1,7 @@
 import { MessageSquareText, Library, StickyNote, Network } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
+import { ChatSidebar } from "../chat/ChatSidebar";
+import { useAppStore } from "../../store/appStore";
 
 function EmptyState({
   icon,
@@ -21,10 +23,13 @@ function EmptyState({
   );
 }
 
-/** 侧边栏：四个标签页（AI解答 / 术语库 / 笔记 / 知识图谱） */
+/** 侧边栏：四个标签页（AI解答 / 术语库 / 笔记 / 知识图谱），标签受控便于外部跳转 */
 export function Sidebar() {
+  const sidebarTab = useAppStore((s) => s.sidebarTab);
+  const setSidebarTab = useAppStore((s) => s.setSidebarTab);
+
   return (
-    <Tabs defaultValue="ai" className="flex h-full flex-col">
+    <Tabs value={sidebarTab} onValueChange={(v) => setSidebarTab(v as typeof sidebarTab)} className="flex h-full flex-col">
       <TabsList className="mx-2 mt-2 flex h-9 justify-between gap-1">
         <TabsTrigger value="ai" className="flex-1">
           <MessageSquareText /> AI解答
@@ -40,12 +45,8 @@ export function Sidebar() {
         </TabsTrigger>
       </TabsList>
 
-      <TabsContent value="ai">
-        <EmptyState
-          icon={<MessageSquareText />}
-          title="AI 解答"
-          desc="选中论文文本后可在此与 AI 讨论，支持流式输出"
-        />
+      <TabsContent value="ai" className="min-h-0 flex-1">
+        <ChatSidebar />
       </TabsContent>
       <TabsContent value="terms">
         <EmptyState

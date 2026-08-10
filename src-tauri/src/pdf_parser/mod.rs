@@ -482,13 +482,26 @@ pub fn get_paper_pdf_path(app: AppHandle, pdf_path: String) -> Result<String, St
     }
 }
 
-/// 读取论文 AI 重排产物 papers/{uuid}/restructured.md（占位用，AI 重排功能开发中）。
-/// 不存在返回 Err("NOT_FOUND")，前端据此显示"开发中"提示。
+/// 读取论文 AI 重排产物 papers/{uuid}/restructured.md。
+/// 不存在、或 parsed.json 已变化（restructured.hash 不匹配）时返回
+/// Err("NOT_FOUND")——前端据此触发重新重排（P1-2 缓存失效）。
 #[tauri::command]
 pub fn get_restructured_doc(app: AppHandle, pdf_path: String) -> Result<String, String> {
     let uuid = pdf_uuid(&pdf_path);
-    let p = papers_dir(&app)?.join(&uuid).join("restructured.md");
+    let paper_dir = papers_dir(&app)?.join(&uuid);
+    let p = paper_dir.join("restructured.md");
     if !p.exists() {
+        return Err("NOT_FOUND".into());
+    }
+    // P1-2：缓存失效检测——parsed.json 变化后旧重排文档视为无效
+    let hash_path = paper_dir.join("restructured.hash");
+    let parsed_raw = std::fs::read_to_string(paper_dir.join("parsed.json"))
+        .map_err(|_| "NOT_FOUND".to_string())?;
+    let source_hash = crate::ai::translate::simple_hash(&parsed_raw);
+    let hash_ok = std::fs::read_to_string(&hash_path)
+        .map(|h| h.trim() == source_hash)
+        .unwrap_or(false);
+    if !hash_ok {
         return Err("NOT_FOUND".into());
     }
     std::fs::read_to_string(&p).map_err(|e| format!("读取重排文档失败: {}", e))
@@ -532,6 +545,33 @@ pub fn read_image_base64(app: AppHandle, path: String) -> Result<String, String>
         _ => "image/png",
     };
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+/// 读取论文原 PDF 为 base64（原图视图 pdfjs 加载用）。
+///
+/// 与 read_image_base64 同理：asset 协议对 Windows 反斜杠 URL 的 scope 匹配
+/// 不稳定（收紧 scope 后 original.pdf 加载 403），改用 IPC 直传 100% 可靠。
+/// 路径校验限定在 papers 目录内（防任意文件读取）。PDF 可能较大，上限 200MB
+/// （原图视图本身有 MAX_PDF_PAGES=800 防御，此处兜底防超大文件撑爆内存）。
+#[tauri::command]
+pub fn read_pdf_base64(app: AppHandle, path: String) -> Result<String, String> {
+    let papers = papers_dir(&app)?;
+    let canon = std::fs::canonicalize(&path).map_err(|e| format!("PDF 不存在: {}", e))?;
+    let papers_canon = papers
+        .canonicalize()
+        .map_err(|e| format!("无法定位论文目录: {}", e))?;
+    if !canon.starts_with(&papers_canon) {
+        return Err("非法路径：PDF 必须在论文目录内".into());
+    }
+    let data = std::fs::read(&canon).map_err(|e| format!("读取 PDF 失败: {}", e))?;
+    if data.is_empty() {
+        return Err("PDF 内容为空".into());
+    }
+    if data.len() > 200 * 1024 * 1024 {
+        return Err("PDF 超过 200MB".into());
+    }
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&data))
 }
 
 /// 获取最新的解析错误日志文件路径（供前端“查看详细日志”按钮使用）

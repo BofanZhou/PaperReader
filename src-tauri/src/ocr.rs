@@ -84,6 +84,12 @@ pub async fn ocr_page_image(
             .arg(&lang)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // P2-1：Windows 静默——OCR 子进程不弹黑色控制台窗口（与 parse_pdf 一致）
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
         cmd.output()
     })
     .await

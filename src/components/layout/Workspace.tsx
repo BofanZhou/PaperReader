@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   FileText,
   FolderOpen,
+  Link2,
   Loader2,
   RefreshCw,
 } from "lucide-react";
@@ -14,6 +15,7 @@ import { Button } from "../ui/button";
 import { Progress } from "../ui/progress";
 import { Sidebar } from "./Sidebar";
 import { useAppStore } from "../../store/appStore";
+import { useChatStore } from "../../store/chatStore";
 import { getLastParseLog } from "../../lib/env";
 import { chatCompletion } from "../../lib/ai";
 import { cn } from "../../lib/utils";
@@ -263,6 +265,8 @@ function ReaderView({
   const [originalPdfPath, setOriginalPdfPath] = useState<string | null>(null);
   // 对照模式左栏 source（原图 或 AI 重排）
   const [leftSource, setLeftSource] = useState<"pdf-original" | "restructured">("pdf-original");
+  // 对照模式同步滚动开关（仅 AI 重排 / 译文左右对照等文本列对照生效；原图列不支持）
+  const [syncScroll, setSyncScroll] = useState(false);
 
   // 原图视图下获取 papers/{uuid}/original.pdf（源文件可能已移动，副本始终存在）
   useEffect(() => {
@@ -300,6 +304,57 @@ function ReaderView({
   }, []);
 
   const { model } = useAppStore();
+
+  // ========== 对照模式双向同步滚动（P1-3） ==========
+  // scroll 事件不冒泡但会在捕获阶段经过祖先（capture: true 可收到内部滚动容器
+  // 的 scroll）。以「滚动比例」同步（左右内容高度可能不同，绝对 scrollTop 会
+  // 错位）：源容器滚动比例 → 目标容器按同比例滚动。带 150ms 节流防抖动回环。
+  const leftPaneRef = useRef<HTMLDivElement | null>(null);
+  const rightPaneRef = useRef<HTMLDivElement | null>(null);
+  const syncLockRef = useRef(false);
+  const syncTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    // 仅「对照」视图 + 用户开启同步滚动 + 非原图列时才联动
+    // （原图 pdfjs 列即使挂 data-scroll-container 也不参与，避免页码错位）
+    if (viewMode !== "bilingual" || !syncScroll || leftSource === "pdf-original") return;
+    const left = leftPaneRef.current;
+    const right = rightPaneRef.current;
+    if (!left || !right) return;
+
+    const findScroller = (pane: HTMLElement) =>
+      pane.querySelector<HTMLElement>("[data-scroll-container]");
+    const ratioOf = (el: HTMLElement) =>
+      el.scrollHeight - el.clientHeight > 0
+        ? el.scrollTop / (el.scrollHeight - el.clientHeight)
+        : 0;
+
+    const apply = (src: HTMLElement, dst: HTMLElement | null) => {
+      if (!dst || syncLockRef.current) return;
+      syncLockRef.current = true;
+      const ratio = ratioOf(src);
+      dst.scrollTop = ratio * (dst.scrollHeight - dst.clientHeight);
+      if (syncTimerRef.current) window.clearTimeout(syncTimerRef.current);
+      syncTimerRef.current = window.setTimeout(() => {
+        syncLockRef.current = false;
+      }, 150);
+    };
+
+    const onScroll = (e: Event) => {
+      const t = e.target as HTMLElement;
+      if (!t || typeof t.scrollTop !== "number") return;
+      if (left.contains(t)) apply(t, findScroller(right));
+      else if (right.contains(t)) apply(t, findScroller(left));
+    };
+
+    left.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    right.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    return () => {
+      left.removeEventListener("scroll", onScroll, { capture: true });
+      right.removeEventListener("scroll", onScroll, { capture: true });
+      if (syncTimerRef.current) window.clearTimeout(syncTimerRef.current);
+    };
+  }, [viewMode, leftSource, restructuredTranslation, syncScroll]);
 
   // 选中即翻译（单段，真实调用；整篇翻译走顶部按钮）
   const handleTranslate = useCallback(async (text: string, lang: TargetLang) => {
@@ -346,8 +401,12 @@ function ReaderView({
   }, []);
 
   const handleAiDiscuss = useCallback((text: string) => {
-    // Prompt 4 接入聊天侧边栏
-    console.info("[ai-discuss] 将选中文本注入聊天（Prompt 4）:", text.slice(0, 50));
+    // 跳到侧边栏「AI 解答」标签，并把选中文本注入聊天上下文
+    useAppStore.getState().setSidebarTab("ai");
+    void useChatStore.getState().ask(
+      `请围绕以下选中的论文文本进行分析讨论：\n\n${text}`,
+      { context: text },
+    );
   }, []);
 
   const handleExplainFormula = useCallback((text: string) => {
@@ -442,7 +501,7 @@ function ReaderView({
       ) : viewMode === "bilingual" ? (
         <div className="flex h-full">
           {/* 左栏：原图 或 AI 重排（toggle） */}
-          <div className="relative flex-1 border-r border-border">
+          <div ref={leftPaneRef} className="relative flex-1 border-r border-border">
             {leftSource === "pdf-original" ? (
               originalPdfPath ? (
                 <PDFOriginalView
@@ -476,10 +535,33 @@ function ReaderView({
               >
                 AI 重排
               </button>
+              <span className="mx-0.5 h-4 w-px bg-border" aria-hidden />
+              {/* 同步滚动开关：原图（pdfjs）列不支持 → 禁用 */}
+              <button
+                onClick={() => setSyncScroll((v) => !v)}
+                disabled={leftSource === "pdf-original"}
+                title={
+                  leftSource === "pdf-original"
+                    ? "原图模式不支持同步滚动（AI 重排 / 译文左右对照支持）"
+                    : syncScroll
+                      ? "关闭同步滚动"
+                      : "开启同步滚动"
+                }
+                className={cn(
+                  "flex items-center gap-1 rounded-full px-2.5 py-0.5 transition-colors",
+                  syncScroll && leftSource !== "pdf-original"
+                    ? "bg-accent text-fg-inverse"
+                    : "text-fg-secondary hover:text-fg",
+                  leftSource === "pdf-original" && "cursor-not-allowed opacity-40",
+                )}
+              >
+                <Link2 className="size-3.5" />
+                同步滚动
+              </button>
             </div>
           </div>
           {/* 右栏：译文（优先展示 AI 重排文档的译文） */}
-          <div className="flex-1">
+          <div ref={rightPaneRef} className="flex-1">
             {restructuredTranslation ? (
               <RestructuredMarkdown markdown={restructuredTranslation} parsedResult={result} />
             ) : (

@@ -15,6 +15,7 @@ import {
 } from "../lib/ai";
 
 export type ViewMode = "pdf-original" | "restructured" | "translated" | "bilingual";
+export type SidebarTab = "ai" | "terms" | "notes" | "graph";
 
 type ParseState = "idle" | "parsing" | "error" | "success";
 type TranslateState = "idle" | "translating" | "error" | "success";
@@ -35,6 +36,9 @@ interface AppState {
   /** 模型列表（单一数据源 = Rust default_models()，经 get_ai_config 下发） */
   models: ModelConfig[];
   modelsLoaded: boolean;
+  /** 右侧边栏当前标签页 */
+  sidebarTab: SidebarTab;
+  setSidebarTab: (tab: SidebarTab) => void;
 
   // PDF 解析
   parseState: ParseState;
@@ -64,7 +68,8 @@ interface AppState {
   loadModels: () => Promise<void>;
   runParse: () => Promise<void>;
   resetParse: () => void;
-  runTranslate: () => Promise<void>;
+  /** 整篇翻译。lang 目标语言（默认 zh；P2-7：不再硬编码） */
+  runTranslate: (lang?: string) => Promise<void>;
   resetTranslate: () => void;
   runRestructure: (force?: boolean) => Promise<void>;
   resetRestructure: () => void;
@@ -80,6 +85,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   model: "deepseek-v4-flash",
   models: [],
   modelsLoaded: false,
+  sidebarTab: "ai",
+  setSidebarTab: (tab) => set({ sidebarTab: tab }),
 
   parseState: "idle",
   parseProgress: null,
@@ -192,7 +199,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       estimatedCostUsd: null,
     }),
 
-  runTranslate: async () => {
+  runTranslate: async (lang = "zh") => {
     const { currentFile, model, restructuredDoc } = get();
     if (!currentFile) return;
     if (get().translateState === "translating") return;
@@ -222,7 +229,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
 
       if (restructuredMd) {
-        const result = await translateRestructuredDoc(fileAtStart, "zh", model);
+        const result = await translateRestructuredDoc(fileAtStart, lang, model);
         // 已切换论文 / 已发起新翻译 → 丢弃过期结果（P2 竞态修复）
         if (reqId !== translateReqId || get().currentFile !== fileAtStart) return;
         set({
@@ -234,7 +241,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
 
-      const result: TranslateResult = await translatePaper(fileAtStart, "zh", model);
+      const result: TranslateResult = await translatePaper(fileAtStart, lang, model);
       if (reqId !== translateReqId || get().currentFile !== fileAtStart) return;
       set({
         translateState: "success",
@@ -294,3 +301,23 @@ export const useAppStore = create<AppState>((set, get) => ({
       restructureError: null,
     }),
 }));
+
+// ========== 事件监听清理（P2-6） ==========
+// unlistenProgress/unlistenTranslate/unlistenRestructure 赋值后从未被调用，
+// HMR（vite dev 热更新）/ StrictMode 双挂载会累积监听，导致同一事件被回调多次。
+// 提供模块级 cleanup：main.tsx 的 HMR dispose / 应用卸载时调用。
+export function cleanupAppStoreListeners() {
+  unlistenProgress?.();
+  unlistenTranslate?.();
+  unlistenRestructure?.();
+  unlistenProgress = null;
+  unlistenTranslate = null;
+  unlistenRestructure = null;
+}
+
+// vite HMR：模块被替换前清理旧监听（dev 模式防泄漏）
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    cleanupAppStoreListeners();
+  });
+}

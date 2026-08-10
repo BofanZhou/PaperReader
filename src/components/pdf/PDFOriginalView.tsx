@@ -12,7 +12,7 @@
  * 依赖 pdfjs-dist（懒加载：仅进入本视图才下载 ~750KB 主库 + worker）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 // ?url 只引入 worker 文件 URL 常量（不打包 worker 代码进主包）
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "pdfjs-dist/web/pdf_viewer.css";
@@ -78,7 +78,20 @@ export function PDFOriginalView({ pdfPath, onSelectText, onContextMenuAction }: 
       try {
         const pdfjs = await import("pdfjs-dist");
         pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-        const task = pdfjs.getDocument({ url: convertFileSrc(pdfPath) });
+        // 原图 PDF 改走 IPC base64 读取（R2-2）：asset 协议对 Windows 反斜杠
+        // URL 的 scope 匹配不稳定，scope 收紧后 convertFileSrc 加载 original.pdf
+        // 返回 403（与图片 403 同根因）。IPC 直传 100% 可靠。
+        const b64 = await invoke<string>("read_pdf_base64", { path: pdfPath });
+        // 分块解码：atob 对超大字符串（几十 MB）在部分引擎有调用栈/性能问题，
+        // 按 16KB 块增量解码为 Uint8Array，内存峰值可控。
+        const bytes = new Uint8Array(Math.floor((b64.length * 3) / 4));
+        let outLen = 0;
+        const CHUNK = 0x4000; // 16KB 字符
+        for (let i = 0; i < b64.length; i += CHUNK) {
+          const decoded = atob(b64.slice(i, i + CHUNK));
+          for (let j = 0; j < decoded.length; j++) bytes[outLen++] = decoded.charCodeAt(j);
+        }
+        const task = pdfjs.getDocument({ data: bytes.subarray(0, outLen) });
         loadingTaskRef.current = task;
         const pdf = await task.promise;
         if (cancelled) {
@@ -244,6 +257,7 @@ export function PDFOriginalView({ pdfPath, onSelectText, onContextMenuAction }: 
         scrollRef.current = el;
       }}
       className="relative h-full overflow-y-auto overflow-x-auto bg-bg-tertiary/40"
+      data-scroll-container
     >
       <div className="mx-auto w-fit px-6 py-4" data-testid="pdf-original-view">
         {pages}

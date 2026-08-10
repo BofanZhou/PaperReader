@@ -197,18 +197,32 @@ pub async fn ai_restructure(
     let uuid = super::super::pdf_parser::pdf_uuid(&pdf_path);
     let paper_dir = super::super::pdf_parser::papers_dir(&app)?.join(&uuid);
     let md_path = paper_dir.join("restructured.md");
+    let hash_path = paper_dir.join("restructured.hash");
 
-    // 已有且非强制 → 直接返回（前端已读缓存时不会走到这里，双保险）
+    // 1. 先读解析缓存计算 hash（P1-2：缓存失效检测——parsed.json 变化后
+    //    旧 restructured.md 必须视为失效，否则展示过期重排结果）
+    let parsed_raw = std::fs::read_to_string(paper_dir.join("parsed.json"))
+        .map_err(|_| "ERR:PARSE_NOT_FOUND:论文尚未解析，请先打开 PDF".to_string())?;
+    let source_hash = super::translate::simple_hash(&parsed_raw);
+
+    // 已有且非强制，且 hash 匹配（parsed.json 未变）→ 直接返回
+    // （前端已读缓存时不会走到这里，双保险）
     if !force && md_path.exists() {
-        let content = std::fs::read_to_string(&md_path)
-            .map_err(|e| format!("读取重排文档失败: {}", e))?;
-        return Ok(RestructuredDoc {
-            markdown: content,
-            figure_count: 0,
-            prompt_tokens: 0,
-            estimated_cost_usd: 0.0,
-            generated_at: String::new(),
-        });
+        let hash_ok = std::fs::read_to_string(&hash_path)
+            .map(|h| h.trim() == source_hash)
+            .unwrap_or(false);
+        if hash_ok {
+            let content = std::fs::read_to_string(&md_path)
+                .map_err(|e| format!("读取重排文档失败: {}", e))?;
+            return Ok(RestructuredDoc {
+                markdown: content,
+                figure_count: 0,
+                prompt_tokens: 0,
+                estimated_cost_usd: 0.0,
+                generated_at: String::new(),
+            });
+        }
+        // hash 不匹配 → 旧缓存失效，继续重新生成
     }
 
     // 同论文并发互斥
@@ -223,9 +237,6 @@ pub async fn ai_restructure(
     };
     emit("prepare", 5, "读取解析结果".into());
 
-    // 1. 读解析缓存
-    let parsed_raw = std::fs::read_to_string(paper_dir.join("parsed.json"))
-        .map_err(|_| "ERR:PARSE_NOT_FOUND:论文尚未解析，请先打开 PDF".to_string())?;
     let parsed: serde_json::Value = serde_json::from_str(&parsed_raw)
         .map_err(|e| format!("读取解析结果失败: {}", e))?;
     let (items, figures, tables) = extract_items_and_assets(&parsed);
@@ -304,9 +315,12 @@ pub async fn ai_restructure(
     }
     let markdown = md_parts.join("\n\n");
 
-    // 5. 落盘
+    // 5. 落盘（原子写：tmp + rename，防中断写坏缓存；P2-4）+ hash 文件（P1-2）
     std::fs::create_dir_all(&paper_dir).map_err(|e| e.to_string())?;
-    std::fs::write(&md_path, &markdown).map_err(|e| format!("写入重排文档失败: {}", e))?;
+    let tmp_path = paper_dir.join("restructured.md.tmp");
+    std::fs::write(&tmp_path, &markdown).map_err(|e| format!("写入重排文档失败: {}", e))?;
+    std::fs::rename(&tmp_path, &md_path).map_err(|e| format!("保存重排文档失败: {}", e))?;
+    std::fs::write(&hash_path, &source_hash).map_err(|e| format!("写入重排校验失败: {}", e))?;
 
     // 6. 成本（输出按输入 1.5 倍）
     let input_tokens = total_prompt as f64;
