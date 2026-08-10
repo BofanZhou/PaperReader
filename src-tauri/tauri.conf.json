@@ -40,7 +40,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["scripts/**"],
+    "resources": ["scripts/parse_pdf.py", "scripts/ocr_page.py"],
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
