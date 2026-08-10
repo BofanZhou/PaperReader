@@ -46,11 +46,7 @@
         "installerIcon": "icons/icon.ico",
         "installMode": "currentUser",
         "displayLanguageSelector": true,
-        "languages": ["SimpChinese", "English"],
-        "webviewInstallMode": {
-          "type": "downloadBootstrapper",
-          "silent": true
-        }
+        "languages": ["SimpChinese", "English"]
       },
       "wix": {
         "language": "zh-CN"
