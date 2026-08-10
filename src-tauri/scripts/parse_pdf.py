@@ -35,6 +35,13 @@ import traceback
 import opendataloader_pdf
 from pypdf import PdfReader
 
+# 椭圆首次落库时尝试导入 fitz（PyMuPDF），失败则在矢量图兜底时降级为纯文本
+try:
+    import fitz  # type: ignore
+    _HAS_FITZ = True
+except ImportError:
+    _HAS_FITZ = False
+
 # 强制 stdout/stderr 使用 UTF-8 —— Rust 端 BufReader::lines() 按 UTF-8 解析；
 # Windows 上 Python 默认 cp936，含中文消息时会导致 Rust 端读流中断。
 # reconfigure 是 no-op 若 stdout 已被替换（如 _NullStdout）。
@@ -308,6 +315,73 @@ def convert(raw: dict, page_sizes: list[tuple[float, float]], work_dir: str) -> 
 
     # 后处理（可读性优化）：双栏重排 → 断句合并 → 标题识别增强
     _post_process(pages, page_sizes)
+
+    # ========== 补采：openDataLoader 嵌套在 list/figure/table 等容器 kids 内的图片 ==========
+    # 顶层 raw.kids 之外的图片（最常见：编号列表/参考文献条目内嵌的曲线图）之前被完全丢弃。
+    # 用 DFS 遍历整棵树，对 src 未被收录的图片追加为 figure 元素。已收录的跳过（避免重复）。
+    seen_srcs = set()
+    for _pn, _els in pages.items():
+        for _el in _els:
+            if _el.get("imageSrc"):
+                seen_srcs.add(_el["imageSrc"])
+
+    def _walk(n):
+        # 完整 DFS：遍历所有 dict/list 字段（含 kids / list_items / rows 等命名），
+        # 避免漏掉 OpenDataLoader 把图片嵌套在 list/figure/table 子字段的情况
+        if isinstance(n, list):
+            for x in n:
+                yield from _walk(x)
+        elif isinstance(n, dict):
+            if n.get("type") == "image" and n.get("source"):
+                yield n
+            for v in n.values():
+                if isinstance(v, (list, dict)):
+                    yield from _walk(v)
+
+    for el in _walk(raw):
+        src = el.get("source")
+        if not src:
+            continue
+        img_src = os.path.abspath(os.path.join(work_dir, src))
+        if img_src in seen_srcs:
+            continue
+        page_num = _safe_int(el.get("page number"), default=1) or 1
+        if page_num < 1:
+            continue
+        # 同样过 _is_noise 过滤（logo/小图等）—— 顶层图片已过滤，嵌套的也要
+        page_h = page_sizes[page_num - 1][1] if page_num - 1 < len(page_sizes) else 0
+        if _is_noise(el, page_h):
+            continue
+        bbox = el.get("bounding box") or [0.0, 0.0, 0.0, 0.0]
+        seen_srcs.add(img_src)
+        pages.setdefault(page_num, []).append(
+            {
+                "id": str(el.get("id", reading_order)),
+                "type": "figure",
+                "bbox": {
+                    "left": bbox[0],
+                    "bottom": bbox[1],
+                    "right": bbox[2],
+                    "top": bbox[3],
+                },
+                "text": "",
+                "font": el.get("font"),
+                "fontSize": el.get("font size"),
+                "headingLevel": None,
+                "readingOrder": reading_order,
+                "imageSrc": img_src,
+            }
+        )
+        reading_order += 1
+
+    # ========== 兜底：矢量图（OpenDataLoader 漏抽的曲线/示意图） 按图注位置裁剪 ==========
+    # 适用场景：docling-fast / 纯 Java 后端对 PDF 矢量图（line chart / vector diagram）
+    # 不抽 image 元素，只把图注当 paragraph。图注一般出现在图下方，从页顶到图注
+    # bbox.top 之间的区域就是图本身。
+    # 判定：paragraph 文本以 "Fig. N" / "Figure N" 开头，且同页没有 imageSrc figure →
+    #       视为该页图缺失，按图注 bbox 向上裁剪该区域为 PNG 插入 figure 元素。
+    _rescue_vector_figures(pages, page_sizes, work_dir, reading_order)
+
     # 重排/合并后重新分配全局 readingOrder（页间顺序不变，页内按新顺序）
     order = 0
     for p in range(len(page_sizes)):
@@ -660,6 +734,95 @@ def _detect_table_runs(elements: list[dict]) -> list[dict]:
     # 表格作为块级元素，按 top 排序后 merge
     merged = sorted(out + table_els, key=lambda e: (e["bbox"]["top"]), reverse=True)
     return merged
+
+
+def _rescue_vector_figures(
+    pages: dict[int, list[dict]],
+    page_sizes: list[tuple[float, float]],
+    work_dir: str,
+    start_reading_order: int,
+) -> None:
+    """OpenDataLoader 漏抽的矢量图（PDF 内的矢量曲线图 / 向量示意图）兜底。
+
+    docling-fast / 纯 Java 后端对 PDF 矢量图经常不抽 image 元素，只把图注当 paragraph。
+    判定：paragraph 文本以 "Fig. N" / "Figure N" 开头，且同页没有 imageSrc figure →
+          把图注上方页面区域按 fitz 渲染为 PNG，作为 figure 元素插入。
+    依赖 PyMuPDF（env_manager 已安装），缺失时跳过。
+    """
+    if not _HAS_FITZ:
+        return
+    pdf_path = os.path.join(os.path.dirname(work_dir.rstrip("\/")), "original.pdf")
+    if not os.path.exists(pdf_path):
+        return
+    fig_re = re.compile(r"^\s*(?:Fig|Figure)\.?\s*(\d+)\b", re.IGNORECASE)
+    img_dir = os.path.join(work_dir, "_images")
+    os.makedirs(img_dir, exist_ok=True)
+    try:
+        fitz_doc = fitz.open(pdf_path)
+    except Exception:
+        return
+
+    next_order = start_reading_order
+    try:
+        for pn, els in list(pages.items()):
+            # 已含带 imageSrc 的 figure → 该页图已抓到，不再兜底
+            if any(e.get("type") == "figure" and e.get("imageSrc") for e in els):
+                continue
+            caps = []
+            for idx, el in enumerate(els):
+                if el.get("type") == "paragraph" and fig_re.match(el.get("text", "")):
+                    caps.append((idx, el.get("bbox", {}).get("top", 0)))
+            if not caps:
+                continue
+            caps.sort(key=lambda x: x[1], reverse=True)
+
+            pn_idx = pn - 1
+            if pn_idx < 0 or pn_idx >= len(fitz_doc):
+                continue
+            fitz_page = fitz_doc[pn_idx]
+            page_h = fitz_page.rect.height
+            page_w = fitz_page.rect.width
+
+            for i, (cap_idx, _cap_top) in enumerate(caps):
+                cap_top = _cap_top
+                upper_pdf = page_h if i == 0 else caps[i - 1][1]
+                lower_pdf = cap_top
+                if upper_pdf - lower_pdf < 50:
+                    continue
+                # PDF bottom-left -> fitz top-left: fitz_y = page_h - pdf_y
+                rect = fitz.Rect(
+                    0,
+                    max(0, page_h - upper_pdf),
+                    page_w,
+                    max(0, page_h - lower_pdf),
+                )
+                try:
+                    pix = fitz_page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect)
+                    out_path = os.path.join(img_dir, f"vector_fig_p{pn}_{i}.png")
+                    pix.save(out_path)
+                except Exception as e:
+                    continue
+                figure_el = {
+                    "id": f"vfig-{pn}-{i}",
+                    "type": "figure",
+                    "bbox": {
+                        "left": 0,
+                        "bottom": lower_pdf,
+                        "right": page_w,
+                        "top": upper_pdf,
+                    },
+                    "text": "",
+                    "font": None,
+                    "fontSize": None,
+                    "headingLevel": None,
+                    "readingOrder": next_order,
+                    "imageSrc": os.path.abspath(out_path),
+                    "_rescued": True,
+                }
+                pages[pn].insert(cap_idx + i, figure_el)
+                next_order += 1
+    finally:
+        fitz_doc.close()
 
 
 def _render_table_images(result: dict, fitz_doc, work_dir: str) -> None:
