@@ -1,8 +1,9 @@
 fn main() {
     tauri_build::build();
 
-    // 编译时将 Python 解析脚本复制到 exe 同目录的 scripts/ 下，
-    // 这样双击 exe 启动时 Rust 端能在 `exe_dir/scripts/` 找到它们。
+    // 编译时将 Python 解析脚本复制到 target/{debug,release}/scripts/ 下，
+    // 这样 dev（cargo run）与 release（tauri build 产出的 exe）都能在
+    // `exe_dir/scripts/` 找到它们（script_path 查找链第 2 项）。
     // 直接强制拷贝，不做 mtime 比较 —— NTFS 上偶尔出现 dst ≥ src 的
     // 误判，导致 src 改动后 target 仍是旧版本（已踩过两次坑）。
     for script in ["parse_pdf.py", "ocr_page.py"] {
@@ -22,13 +23,15 @@ fn copy_script(script: &str) {
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
         if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
             let src = std::path::Path::new(&manifest_dir).join(&script_src);
-            let dst_dir = std::path::Path::new(&target_dir).join("debug").join("scripts");
-            let dst = dst_dir.join(script);
-            // 文件只有几 KB，开销可忽略
-            if let Err(e) = force_copy(&src, &dst) {
-                eprintln!("build.rs: 复制脚本到 target/debug 失败 ({}): {}", script, e);
-            } else {
-                println!("cargo:rerun-if-changed={}", src.display());
+            // debug（cargo run）+ release（tauri build）都要复制；文件几 KB，开销可忽略
+            for profile in ["debug", "release"] {
+                let dst_dir = std::path::Path::new(&target_dir).join(profile).join("scripts");
+                let dst = dst_dir.join(script);
+                if let Err(e) = force_copy(&src, &dst) {
+                    eprintln!("build.rs: 复制脚本到 target/{} 失败 ({}): {}", profile, script, e);
+                } else {
+                    println!("cargo:rerun-if-changed={}", src.display());
+                }
             }
         }
     }

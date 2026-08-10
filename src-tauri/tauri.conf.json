@@ -39,6 +39,22 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": ["scripts/**"],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "currentUser",
+        "displayLanguageSelector": true,
+        "languages": ["SimpChinese", "English"],
+        "webviewInstallMode": {
+          "type": "downloadBootstrapper",
+          "silent": true
+        }
+      },
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
   }
 }

@@ -286,9 +286,46 @@ export async function setSetting(key: string, value: string): Promise<void> {
   );
 }
 
-// ========== Prompt 9 术语库 / 备份 ==========
+// ========== Prompt 10 数据库优化：分页查询 ==========
 
-/** 读取全部设置（key → value），供备份导出 */
+export interface ElementRow {
+  id: string;
+  page_number: number;
+  element_type: string;
+  bbox_left: number | null;
+  bbox_bottom: number | null;
+  bbox_right: number | null;
+  bbox_top: number | null;
+  original_text: string | null;
+  translated_text: string | null;
+  reading_order: number | null;
+}
+
+/**
+ * 大论文分页查询（Prompt 10 §2：每次查 5 页，配合 idx_elements_paper_page 复合索引）。
+ * 返回 [startPage, startPage+pageCount) 范围内的元素，按页/阅读序排列。
+ * 注：当前主数据源仍为文件缓存 parsed.json（DB 为旁路），此函数供 P10 后续
+ * 将 PDFViewer 数据源迁移到 DB 时使用。
+ */
+export async function getPaperElementsPaged(
+  paperId: string,
+  startPage: number,
+  pageCount = 5,
+): Promise<ElementRow[]> {
+  const db = await getDb();
+  await schemaReady;
+  return db.select<ElementRow[]>(
+    `SELECT id, page_number, element_type,
+            bbox_left, bbox_bottom, bbox_right, bbox_top,
+            original_text, translated_text, reading_order
+     FROM page_elements
+     WHERE paper_id = $1 AND page_number >= $2 AND page_number < $3
+     ORDER BY page_number, reading_order`,
+    [paperId, startPage, startPage + pageCount],
+  );
+}
+
+// ========== Prompt 9 术语库 / 备份 ==========/** 读取全部设置（key → value），供备份导出 */
 export async function getAllSettings(): Promise<Record<string, string>> {
   const db = await getDb();
   await schemaReady;

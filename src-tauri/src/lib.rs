@@ -3,6 +3,7 @@
 mod ai;
 mod cleanup;
 mod env_manager;
+mod error_log;
 mod net;
 mod ocr;
 mod pdf_parser;
@@ -19,6 +20,8 @@ pub fn run() {
         .setup(|app| {
             // 启动时清理过期临时文件（工程补充文档 §4.3）
             let _ = cleanup::cleanup_temp_files(app.handle());
+            // Rust panic 写本地日志（Prompt 10 §8）
+            error_log::install_panic_hook(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -44,6 +47,7 @@ pub fn run() {
             ai::translate::translate_restructured_doc,
             ai::restructure::ai_restructure,
             ocr::ocr_page_image,
+            error_log::append_app_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

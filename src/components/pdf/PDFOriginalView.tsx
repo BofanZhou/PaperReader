@@ -41,7 +41,9 @@ interface OcrWord {
 }
 
 const PAGE_GAP = 24; // 页间距 px
-const PAGE_OVERSCAN = 2; // 可视范围外预渲染页数
+const PAGE_OVERSCAN = 2; // 可视范围外预渲染页数（Prompt 10 §1：±2 页虚拟滚动，全页数生效）
+// Prompt 10 §1：>50 页大 PDF 强制虚拟滚动——当前实现对所有页数恒启用（range 窗口
+// 渲染 + 滚动动态加载/卸载），大于 50 页时天然生效，无需额外开关。
 const MAX_PDF_PAGES = 800; // 防御：超大 PDF 限制
 
 /**

@@ -74,6 +74,12 @@ export function Workspace({ onOpenFile }: Props) {
   } = useAppStore();
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT);
   const dragging = useRef(false);
+  // 启动优化（Prompt 10 §5）：主界面优先渲染，侧边栏延迟 500ms 挂载
+  const [sidebarReady, setSidebarReady] = useState(false);
+  useEffect(() => {
+    const t = window.setTimeout(() => setSidebarReady(true), 500);
+    return () => window.clearTimeout(t);
+  }, []);
 
   // 说明：解析由 store.setCurrentFile 统一触发（含竞态防护与状态清空），
   // 这里不再重复监听 currentFile 调 runParse，避免同一文件被解析两次。
@@ -136,12 +142,16 @@ export function Workspace({ onOpenFile }: Props) {
         tabIndex={0}
       />
 
-      {/* 侧边栏 */}
+      {/* 侧边栏（延迟挂载：主界面优先渲染） */}
       <div
         className="shrink-0 border-l border-border bg-bg-secondary"
         style={{ width: sidebarWidth }}
       >
-        <Sidebar />
+        {sidebarReady ? (
+          <Sidebar />
+        ) : (
+          <div className="flex h-full items-center justify-center text-xs text-fg-tertiary">加载中…</div>
+        )}
       </div>
     </div>
   );

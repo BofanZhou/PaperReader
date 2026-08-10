@@ -2,6 +2,7 @@ import { Component, type ErrorInfo, type ReactNode } from "react";
 import { AlertTriangle, RotateCcw } from "lucide-react";
 import { Button } from "./ui/button";
 import { redactSensitive } from "../lib/utils";
+import { logError } from "../lib/errorLog";
 
 interface Props {
   children: ReactNode;
@@ -24,8 +25,9 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    // 生产环境可接入 Sentry / 本地日志
+    // 本地日志（Prompt 10 §8）：错误 + 组件栈写入 logs/app.log，发布版可定位
     console.error("[ErrorBoundary]", error, info.componentStack);
+    logError("ErrorBoundary", `${error}\ncomponentStack: ${info.componentStack ?? ""}`);
   }
 
   render() {

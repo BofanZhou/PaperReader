@@ -42,8 +42,30 @@ export interface ChatMessage {
   content: string;
 }
 
+/**
+ * 带指数退避重试的 invoke（Prompt 10 §6：API 请求超时重试，最多 3 次：1s/2s/4s）。
+ * 仅用于「短、幂等、只读」请求（配置查询 / 连接测试 / 缓存文档读取）；
+ * 长任务（翻译/重排/流式 chat）与有副作用请求不适用——重复调用会重复计费。
+ * 判定：错误消息含业务前缀 `ERR:` 视为业务错误，不重试；否则按网络/IPC 错误重试。
+ */
+async function invokeWithRetry<T>(cmd: string, args?: Record<string, unknown>, retries = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await invoke<T>(cmd, args);
+    } catch (e) {
+      lastErr = e;
+      if (i === retries) break;
+      const msg = String(e);
+      if (msg.includes("ERR:")) break; // 业务错误不重试
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** i)); // 1s → 2s → 4s
+    }
+  }
+  throw lastErr;
+}
+
 /** 获取模型列表 + Key 配置状态（不含 Key 本身） */
-export const getAiConfig = (): Promise<AiConfig> => invoke<AiConfig>("get_ai_config");
+export const getAiConfig = (): Promise<AiConfig> => invokeWithRetry<AiConfig>("get_ai_config");
 
 /** 保存默认模型 */
 export const saveAiConfig = (defaultModel: string): Promise<void> =>
@@ -59,7 +81,7 @@ export const deleteApiKey = (provider: string): Promise<void> =>
 
 /** 测试连接（GET /models） */
 export const testConnection = (provider: string): Promise<string> =>
-  invoke<string>("test_connection", { provider });
+  invokeWithRetry<string>("test_connection", { provider });
 
 /** 非流式 chat 补全 */
 export const chatCompletion = (
@@ -179,7 +201,7 @@ export interface RestructuredDoc {
 
 /** 读取 AI 重排产物（不存在返回 NOT_FOUND 错误） */
 export const getRestructuredDoc = (pdfPath: string): Promise<string> =>
-  invoke<string>("get_restructured_doc", { pdfPath });
+  invokeWithRetry<string>("get_restructured_doc", { pdfPath });
 
 /** 执行 AI 重排（force=true 强制重新生成） */
 export const aiRestructure = (pdfPath: string, force?: boolean): Promise<RestructuredDoc> =>
