@@ -768,7 +768,8 @@ def _rescue_vector_figures(
             # 已含带 imageSrc 的 figure → 该页图已抓到，不再兜底
             if any(e.get("type") == "figure" and e.get("imageSrc") for e in els):
                 continue
-            caps = []
+            # 收集该页所有图注段落（PDF 坐标 bottom-left 原点，top 值越大越靠上）
+            caps: list[tuple[int, float]] = []
             for idx, el in enumerate(els):
                 if el.get("type") == "paragraph" and fig_re.match(el.get("text", "")):
                     caps.append((idx, el.get("bbox", {}).get("top", 0)))
@@ -783,9 +784,25 @@ def _rescue_vector_figures(
             page_h = fitz_page.rect.height
             page_w = fitz_page.rect.width
 
+            # 收集该页所有非图注元素的 bbox.top（按降序），
+            # 用于精确定位每张图上方最近的元素作为裁剪上边界，避免
+            # 首张图把整页顶部正文一起截进。
+            non_cap_tops = sorted(
+                [el.get("bbox", {}).get("top", 0) for el in els
+                 if el.get("type") != "figure"],
+                reverse=True,
+            )
+
             for i, (cap_idx, _cap_top) in enumerate(caps):
                 cap_top = _cap_top
-                upper_pdf = page_h if i == 0 else caps[i - 1][1]
+                # 上边界：本图注上方最近的非图注元素的 top（PDF 坐标中更大的 top = 更靠上）
+                upper_pdf = page_h
+                for t in non_cap_tops:
+                    if t > cap_top:
+                        upper_pdf = t
+                        break
+                # 防止裁剪图过大、把上方正文都截进来：上限不超过 page_h/3
+                upper_pdf = min(upper_pdf, cap_top + page_h / 3)
                 lower_pdf = cap_top
                 if upper_pdf - lower_pdf < 50:
                     continue
