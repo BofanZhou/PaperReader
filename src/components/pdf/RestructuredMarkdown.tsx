@@ -156,6 +156,20 @@ const LATEX_CMD_RE = /\\(?:frac|sqrt|sum|int|tag|left|right|cdot|partial|pi|alph
 const HAS_MATH_DELIM = /\$[\s\S]*?\$/;
 
 /**
+ * 把「单行 `$$...$$`」转成 remark-math 认可的 display 格式（`$$` 独占一行）。
+ *
+ * 背景：AI 重排输出常写成 `$$Q_1 = \frac{...}{...} \tag{1}$$`（单行），
+ * 但 remark-math / micromark 只把 `$$\n...\n$$` 识别为 display math；
+ * 单行 `$$...$$` 会被当成 inline math → KaTeX 在 inline 模式遇到
+ * `\tag` 等命令报错（`\tag works only in display equations`）→ 渲染失败回退原文。
+ * 这里把单行 `$$...$$` 规范为多行，保证走 display 分支。
+ */
+function fixDisplayMath(md: string): string {
+  // 用回调形式拼替换串，避免 String.replace 把 `$$` 当特殊转义
+  return md.replace(/\$\$([^\n$]+?)\$\$/g, (_m, inner: string) => "$$\n" + inner + "\n$$");
+}
+
+/**
  * 兜底：AI 未用 `$...$` 包裹的 LaTeX 公式段落，自动用 `$$...$$` 包裹。
  * 只处理「整段都是 LaTeX」的情况，避免误包正文。
  */
@@ -178,7 +192,8 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
   const { zoom, handleReset, scrollRef } = useViewZoom<HTMLDivElement>({ min: 0.5, max: 3 });
 
   const segments = useMemo(() => {
-    const wrapped = autoWrapLatex(markdown);
+    const fixed = fixDisplayMath(markdown);
+    const wrapped = autoWrapLatex(fixed);
     return splitByPlaceholders(wrapped);
   }, [markdown]);
 
