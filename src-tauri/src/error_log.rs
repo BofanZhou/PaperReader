@@ -49,7 +49,7 @@ fn from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
         d -= mdays;
         mo += 1;
     }
-    (y, mo, (d + 1) as u32, h, mi, s)
+    (y, mo, (d + 1) as u32, h as u32, mi as u32, s as u32)
 }
 
 fn leap(y: i64) -> bool {
