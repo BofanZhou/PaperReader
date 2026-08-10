@@ -29,18 +29,19 @@ import "katex/dist/katex.min.css";
 // ========== XSS 白名单 schema（P0-1） ==========
 // 基于 rehype-sanitize 默认 schema，只额外放行 AI 重排必需的元素/属性：
 // - span：保留 className（katex 类名）+ style（katex 输出用内联 style 精确定位
-//   公式——height/vertical-align/top 等，缺失会导致分数/根号/上下标渲染错乱；
-//   实测 output:"html" 模式 24 个 style 全需保留）
+//   公式——height/vertical-align/top 等，缺失会导致分数/根号/上下标渲染错乱）
 // - code：保留 className（代码高亮类名）
-// 其余（script/iframe/onerror 等事件属性、javascript: URL、object/embed）保持
-// 默认拒绝——实测 XSS 主向量（script/onerror/javascript:href）全部仍被拦截。
-// 注：rehype-katex output:"html" 模式不输出 MathML（math/annotation 扩展冗余但无害）。
+// 注：rehype-sanitize 的属性定义格式是 `["attrName", allowedValue]`，allowedValue
+//     可以是字符串/正则/数组。单字符串 `"className"` 意味着「值必须等于 "className"」
+//     才放行——这会误把 KaTeX 的 `class="katex"`/`class="mord"` 全部 strip 掉。
+//     必须用正则 `/^.*/` 表示任意值。其余（script/iframe/onerror/ javascript:）
+//     仍默认拒绝，XSS 主向量全部拦截。
 const KATEX_SCHEMA = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
-    span: [...(defaultSchema.attributes?.span ?? []), ["className"], ["style"]],
-    code: [...(defaultSchema.attributes?.code ?? []), ["className"]],
+    span: [...(defaultSchema.attributes?.span ?? []), ["className", /^.*/], ["style", /^.*/]],
+    code: [...(defaultSchema.attributes?.code ?? []), ["className", /^.*/]],
   },
 };
 
@@ -198,6 +199,18 @@ export function RestructuredMarkdown({ markdown, parsedResult }: Props) {
                     // 由 KATEX_SCHEMA 扩展提供），拦截 AI 输出的恶意 HTML。
                     [rehypeSanitize, KATEX_SCHEMA],
                   ]}
+                  components={{
+                    // AI 重排 prompt 要求表格用 [表N] 占位符（前后端都有截图），
+                    // 但 AI 偶尔会在 Markdown 里复制一份纯文本表格，导致同一个表
+                    // 既显示成原图又显示成丑文本表格。这里把 AI 输出的表格整体
+                    // 抑制，留下的只有 [表N] 截图。
+                    table: () => null,
+                    thead: () => null,
+                    tbody: () => null,
+                    tr: () => null,
+                    th: () => null,
+                    td: () => null,
+                  }}
                 >
                   {seg.content}
                 </ReactMarkdown>
