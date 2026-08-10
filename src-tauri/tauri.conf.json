@@ -40,11 +40,20 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["scripts/parse_pdf.py", "scripts/ocr_page.py"],
+    "resources": {
+      "scripts/parse_pdf.py": "scripts/parse_pdf.py",
+      "scripts/ocr_page.py": "scripts/ocr_page.py",
+      "webview2/runtime/": "webview2/runtime/",
+      "WebView2Loader.dll": "WebView2Loader.dll"
+    },
     "windows": {
+      "webviewInstallMode": {
+        "type": "fixedRuntime",
+        "path": "webview2/runtime"
+      },
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "installMode": "currentUser",
+        "installMode": "perMachine",
         "displayLanguageSelector": true,
         "languages": ["SimpChinese", "English"]
       },
